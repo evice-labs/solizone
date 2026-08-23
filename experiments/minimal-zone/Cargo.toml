@@ -1,0 +1,19 @@
+[package]
+name = "minimal-zone"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lb-zone-sdk = { package = "logos-blockchain-zone-sdk", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "7e9000318f54dfb12944b397cea713a639d6414d" }
+
+lb-core = { package = "logos-blockchain-core", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "7e9000318f54dfb12944b397cea713a639d6414d" }
+
+lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "7e9000318f54dfb12944b397cea713a639d6414d" }
+
+lb-groth16 = { package = "logos-blockchain-groth16", git = "https://github.com/logos-blockchain/logos-blockchain.git", rev = "7e9000318f54dfb12944b397cea713a639d6414d" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = "0.12"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rand = "0.8"
+hex = "0.4"
+serde_json = "1"
