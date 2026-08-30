@@ -1,0 +1,95 @@
+{
+  "last_msg_id": "178a5b27d36303c80c7615ecf1a4f5da138c7445e48385d0875b876ce808e53c",
+  "pending_txs": [
+    [
+      "2b694f59fcbe84531cd3cfc96592935af7b55c179c098a3a2e4bfd7c90575f4c",
+      {
+        "mantle_tx": {
+          "ops": [
+            {
+              "opcode": 17,
+              "payload": {
+                "channel_id": "4cbae339257687a8a37f76d46b0f8aa80204a0951c50fbcf701e0592afcdd32e",
+                "inscription": "4242424242424242424242424242424242424242424242424242424242424242",
+                "parent": "aceabdcc482512a8b6ded857bbd4cdc7a47727122555846b68c08fbd5e7a64a8",
+                "signer": "19c7730290dfa62a4f2eaeebc764b52dd81982b20f26fbcc056a6115f908d57a"
+              }
+            },
+            {
+              "opcode": 0,
+              "payload": {
+                "inputs": [
+                  "eb52d0ca1e264b5f4db7069e89bdb8db4a6c5cfd13aa70430c8e08feff753c2b"
+                ],
+                "outputs": [
+                  {
+                    "value": 999999984954,
+                    "pk": "08a9dee9b06a2ec6fae91af10ef96b965ed38714fbdd2c53667d2e0555a36b14"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "ops_proofs": [
+          {
+            "Ed25519Sig": "16e90afdb2a9e251b6f5656c2e3f38fbcc4bd88d6f8b55396c1a360dd142bdd2726c301b7bd055f9fa7f4b0189a87f91766189de0f85fdc21c43255c63fbdb07"
+          },
+          {
+            "ZkSig": {
+              "pi_a": "8affb0a2d8309b61e39dd5d045d81a0dbd647d0ee0a66cda3de74dcf1a590d95",
+              "pi_b": "b5c1db2bb65bd08e513ac738eb861679ac9356cfd86e5efc90937d5104994627f8a5bf252b4d6dd8712855ef48ad1fe790256540296826655acfa474bfb8b910",
+              "pi_c": "9e77bd6f056c6b2489e1d1e84043677f62efb3a2ebcc3b82fbd604fa869cc224"
+            }
+          }
+        ]
+      }
+    ],
+    [
+      "b0a1ec95a3abe837acaa1c0318486bfb771671431002f8c7023a0084206fabe0",
+      {
+        "mantle_tx": {
+          "ops": [
+            {
+              "opcode": 17,
+              "payload": {
+                "channel_id": "4cbae339257687a8a37f76d46b0f8aa80204a0951c50fbcf701e0592afcdd32e",
+                "inscription": "68656c6c6f2d736f6c697a6f6e65",
+                "parent": "d411af929c36b89041b7ce89ec0f7ed57a0888ff2742f5ec74b22b60a88717ff",
+                "signer": "19c7730290dfa62a4f2eaeebc764b52dd81982b20f26fbcc056a6115f908d57a"
+              }
+            },
+            {
+              "opcode": 0,
+              "payload": {
+                "inputs": [
+                  "c672cbd3f4713fb0f6948a16c1670f3c93fbbba9de779b20d96b2f828cd3c12c"
+                ],
+                "outputs": [
+                  {
+                    "value": 999999991414,
+                    "pk": "08a9dee9b06a2ec6fae91af10ef96b965ed38714fbdd2c53667d2e0555a36b14"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "ops_proofs": [
+          {
+            "Ed25519Sig": "5ad921ce213b428606647208f041b6d138ac417e358cb069fec3fdc3b8e3aee3d8de61d3e87736400a79d9dd580cf72f3a91de2c3e996fc2a02e791943e3da0f"
+          },
+          {
+            "ZkSig": {
+              "pi_a": "e489da40e5749a8f1577fb30fdef8fe34fb0d73e9ab01ea5c846b5a5a53eb923",
+              "pi_b": "d71033ddfe293e73f2233a41c252ff23779dab6555cc2cb04de3543c5eab4f2af809d7449e3d31a624ab2bec1fd1c7f36f4d8a4e113fdff6c0967b22d913370e",
+              "pi_c": "c30e594291890a44f5f95a8c9ba5504a4ba7bf6be8c22b04629c66bde5cb7e0d"
+            }
+          }
+        ]
+      }
+    ]
+  ],
+  "lib": "c6da22d23754c0680abd4dc63d0d67c19281717868efae8e6ab032d571417950",
+  "lib_slot": 1597991
+}

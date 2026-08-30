@@ -1,0 +1,13 @@
+payload_bytes,payload_kib,status,mempool_seconds,required_tx_fee,max_tx_fee,finalization_seconds,l1_slot
+128,0.125,mempool_accepted,0.597756959,,,,
+1024,1.0,mempool_accepted,0.243728417,,,,
+4096,4.0,mempool_accepted,0.112989833,,,,
+16384,16.0,mempool_accepted,0.132875042,,,,
+32768,32.0,mempool_accepted,0.528583792,,,,
+65536,64.0,mempool_accepted,0.966568041,,,,
+131072,128.0,funding_fee_cap,,1841020,1000000,,
+131072,128.0,mempool_accepted,0.513812416,,,,
+262144,256.0,mempool_accepted,0.570210584,,,,
+524288,512.0,funding_fee_cap,,7346044,5000000,,
+524288,512.0,mempool_accepted,1.039942917,,,,
+1048576,1024.0,mempool_accepted,4.412994292,,,,
