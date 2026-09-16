@@ -1,4 +1,4 @@
-# Solizone Development Roadmap
+# Solizone Tentative Development Roadmap (outdated: refer to v2)
 
 **Solizone** is a tentative research and development project for building an **EVM-compatible Sovereign Zone** on the Logos Blockchain.
 
