@@ -1,3 +1,4 @@
+mod block;
 mod execution;
 
 use execution::RevmExecutionEngine;

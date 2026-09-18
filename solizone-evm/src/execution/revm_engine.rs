@@ -1,3 +1,5 @@
+use super::receipt::ExecutionReceipt;
+
 use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
     context::TxEnv,
@@ -5,6 +7,14 @@ use revm::{
     primitives::{Address, B256, Bytes, TxKind, U256},
     state::AccountInfo,
 };
+
+use crate::execution::receipt::ExecutionStatus;
+
+use crate::execution::receipts_root::{
+    build_receipt_proof, compute_receipts_root, verify_receipt_proof,
+};
+
+use crate::block::SolizoneBlockHeader;
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -34,9 +44,11 @@ pub struct ContractCallOutcome {
 pub struct SolidityCounterOutcome {
     pub contract_address: Address,
     pub count: U256,
-    pub deploy_gas_used: u64,
-    pub increment_gas_used: u64,
-    pub read_gas_used: u64,
+    pub deploy_receipt: ExecutionReceipt,
+    pub increment_receipt: ExecutionReceipt,
+    pub read_receipt: ExecutionReceipt,
+    pub revert_receipt: ExecutionReceipt,
+    pub halt_receipt: ExecutionReceipt,
 }
 
 pub struct RevmExecutionEngine;
@@ -372,7 +384,7 @@ impl RevmExecutionEngine {
             .created_address()
             .expect("Counter deployment returned no contract address");
 
-        let deploy_gas_used = deploy_result.gas().tx_gas_used();
+        let deploy_receipt = ExecutionReceipt::from_revm(&deploy_result);
 
         // TX #2 — Call increment()
         //
@@ -395,7 +407,43 @@ impl RevmExecutionEngine {
             .transact_commit(increment_tx)
             .expect("increment() call failed");
 
-        let increment_gas_used = increment_result.gas().tx_gas_used();
+        let increment_receipt = ExecutionReceipt::from_revm(&increment_result);
+
+        let fail_tx = TxEnv::builder()
+            .caller(deployer)
+            .kind(TxKind::Call(contract_address))
+            .data(Bytes::from(vec![0xa9, 0xcc, 0x47, 0x18]))
+            .gas_limit(100_000)
+            .gas_price(0)
+            .gas_priority_fee(None)
+            .nonce(2)
+            .build()
+            .unwrap();
+
+        let fail_result = evm
+            .transact(fail_tx)
+            .expect("fail() transaction should execute");
+
+        let revert_receipt = ExecutionReceipt::from_revm(&fail_result.result);
+
+        let halt_tx = TxEnv::builder()
+            .caller(deployer)
+            .kind(TxKind::Call(contract_address))
+            .data(Bytes::from(vec![
+                0xd0, 0x9d, 0xe0, 0x8a, // increment()
+            ]))
+            .gas_limit(25_100)
+            .gas_price(0)
+            .gas_priority_fee(None)
+            .nonce(2)
+            .build()
+            .unwrap();
+
+        let halt_result = evm
+            .transact(halt_tx)
+            .expect("out-of-gas call should execute");
+
+        let halt_receipt = ExecutionReceipt::from_revm(&halt_result.result);
 
         // TX #3 - Read count()
         //
@@ -419,7 +467,7 @@ impl RevmExecutionEngine {
 
         let count_result = evm.transact(count_tx).expect("count() call failed");
 
-        let read_gas_used = count_result.result.gas().tx_gas_used();
+        let read_receipt = ExecutionReceipt::from_revm(&count_result.result);
 
         let count_output = count_result
             .result
@@ -431,9 +479,11 @@ impl RevmExecutionEngine {
         SolidityCounterOutcome {
             contract_address,
             count,
-            deploy_gas_used,
-            increment_gas_used,
-            read_gas_used,
+            deploy_receipt,
+            increment_receipt,
+            read_receipt,
+            revert_receipt,
+            halt_receipt,
         }
     }
 }
@@ -524,16 +574,111 @@ mod tests {
 
         let outcome = engine.deploy_increment_and_read_counter(deployer, U256::from(10_000_000));
 
+        let receipts = vec![
+            outcome.deploy_receipt.clone(),
+            outcome.increment_receipt.clone(),
+        ];
+
+        let receipts_root = compute_receipts_root(&receipts);
+
+        let header = SolizoneBlockHeader {
+            version: 1,
+            chain_id: 9001,
+            height: 0,
+            parent_hash: B256::ZERO,
+            timestamp: 1_800_000_000,
+
+            // Still placeholders for now.
+            state_root: B256::ZERO,
+            transactions_root: B256::ZERO,
+
+            // Real REVM-derived receipt commitment.
+            receipts_root,
+
+            gas_limit: 30_000_000,
+
+            gas_used: outcome.deploy_receipt.gas_used + outcome.increment_receipt.gas_used,
+        };
+
+        assert_eq!(header.encode().len(), 170);
+
+        assert_eq!(header.receipts_root, receipts_root);
+
+        println!("Block receipts root: {}", header.receipts_root);
+
+        println!("Block gas used: {}", header.gas_used);
+
+        println!("Block hash: {}", header.hash());
+
+        let increment_proof =
+            build_receipt_proof(&receipts, 1).expect("failed to build increment receipt proof");
+
+        let proof_valid = verify_receipt_proof(&receipts[1], &increment_proof, receipts_root);
+
         assert_eq!(outcome.count, U256::from(1));
+
+        assert_eq!(outcome.deploy_receipt.status, ExecutionStatus::Success);
+
+        assert_eq!(outcome.increment_receipt.status, ExecutionStatus::Success);
+
+        assert_eq!(outcome.read_receipt.status, ExecutionStatus::Success);
+
+        assert_eq!(
+            outcome.deploy_receipt.contract_address,
+            Some(outcome.contract_address)
+        );
+
+        assert_eq!(outcome.increment_receipt.contract_address, None);
+
+        assert_eq!(outcome.read_receipt.contract_address, None);
+
+        assert_eq!(outcome.increment_receipt.logs.len(), 1);
+
+        assert_eq!(outcome.deploy_receipt.logs.len(), 0);
+
+        assert_eq!(outcome.read_receipt.logs.len(), 0);
+
+        assert!(proof_valid);
+
+        assert_eq!(outcome.revert_receipt.status, ExecutionStatus::Revert);
+
+        assert_eq!(outcome.halt_receipt.status, ExecutionStatus::Halt);
+
+        println!("Revert receipt: {:?}", outcome.revert_receipt);
+        println!("Halt receipt: {:?}", outcome.halt_receipt);
+
+        let mut tampered_receipt = receipts[1].clone();
+
+        tampered_receipt.gas_used += 1;
+
+        let tampered_valid =
+            verify_receipt_proof(&tampered_receipt, &increment_proof, receipts_root);
+
+        assert!(!tampered_valid);
+
+        println!("Tampered receipt proof valid: {}", tampered_valid);
 
         println!("Counter address: {}", outcome.contract_address);
 
         println!("Counter value:   {}", outcome.count);
 
-        println!("Deploy gas:      {}", outcome.deploy_gas_used);
+        println!("Deploy receipt:  {:?}", outcome.deploy_receipt);
 
-        println!("Increment gas:   {}", outcome.increment_gas_used);
+        println!("Increment receipt: {:?}", outcome.increment_receipt);
 
-        println!("Read gas:        {}", outcome.read_gas_used);
+        println!("Read receipt:    {:?}", outcome.read_receipt);
+
+        println!("Increment log: {:?}", outcome.increment_receipt.logs[0]);
+
+        println!(
+            "Increment receipt hash: {}",
+            outcome.increment_receipt.hash()
+        );
+
+        println!("Receipts root: {}", receipts_root);
+
+        println!("Increment proof: {:?}", increment_proof);
+
+        println!("Increment receipt proof valid: {}", proof_valid);
     }
 }
