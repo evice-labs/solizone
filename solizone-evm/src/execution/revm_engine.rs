@@ -8,13 +8,13 @@ use revm::{
     state::AccountInfo,
 };
 
+use crate::execution::transaction::{SolizoneTransaction, TransactionKind};
+
 use crate::execution::receipt::ExecutionStatus;
 
 use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
-
-use crate::block::SolizoneBlockHeader;
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -44,6 +44,8 @@ pub struct ContractCallOutcome {
 pub struct SolidityCounterOutcome {
     pub contract_address: Address,
     pub count: U256,
+    pub state_root: B256,
+    pub transactions: Vec<SolizoneTransaction>,
     pub deploy_receipt: ExecutionReceipt,
     pub increment_receipt: ExecutionReceipt,
     pub read_receipt: ExecutionReceipt,
@@ -364,20 +366,31 @@ impl RevmExecutionEngine {
 
         // TX #1 — Deploy the compiled Solidity Counter
 
-        let deploy_tx = TxEnv::builder()
-            .caller(deployer)
-            .kind(TxKind::Create)
-            .data(counter_creation_bytecode())
-            .value(U256::ZERO)
-            .gas_limit(1_000_000)
+        let deploy_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 0,
+            kind: TransactionKind::Create,
+            value: U256::ZERO,
+            data: counter_creation_bytecode(),
+            gas_limit: 500_000, // keep the same deployment gas limit you were already using
+        };
+
+        println!("Deploy transaction hash: {}", deploy_tx.hash());
+
+        let deploy_env = TxEnv::builder()
+            .caller(deploy_tx.sender)
+            .kind(deploy_tx.revm_kind())
+            .value(deploy_tx.value)
+            .data(deploy_tx.data.clone())
+            .gas_limit(deploy_tx.gas_limit)
             .gas_price(0)
             .gas_priority_fee(None)
-            .nonce(0)
+            .nonce(deploy_tx.nonce)
             .build()
-            .expect("failed to build Counter deployment transaction");
+            .unwrap();
 
         let deploy_result = evm
-            .transact_commit(deploy_tx)
+            .transact_commit(deploy_env)
             .expect("Counter deployment failed");
 
         let contract_address = deploy_result
@@ -391,23 +404,46 @@ impl RevmExecutionEngine {
         // increment() selector:
         // 0xd09de08a
 
-        let increment_tx = TxEnv::builder()
-            .caller(deployer)
-            .kind(TxKind::Call(contract_address))
-            .data(Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]))
-            .value(U256::ZERO)
-            .gas_limit(100_000)
+        let increment_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 1,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from(vec![
+                0xd0, 0x9d, 0xe0, 0x8a, // increment()
+            ]),
+            gas_limit: 100_000,
+        };
+
+        println!("Increment transaction hash: {}", increment_tx.hash());
+
+        let increment_env = TxEnv::builder()
+            .caller(increment_tx.sender)
+            .kind(increment_tx.revm_kind())
+            .value(increment_tx.value)
+            .data(increment_tx.data.clone())
+            .gas_limit(increment_tx.gas_limit)
             .gas_price(0)
             .gas_priority_fee(None)
-            .nonce(1)
+            .nonce(increment_tx.nonce)
             .build()
-            .expect("failed to build increment transaction");
+            .unwrap();
 
         let increment_result = evm
-            .transact_commit(increment_tx)
+            .transact_commit(increment_env)
             .expect("increment() call failed");
 
         let increment_receipt = ExecutionReceipt::from_revm(&increment_result);
+
+        println!(
+            "\n=== REVM committed state ===\n{}",
+            evm.ctx.journaled_state.database.pretty_print()
+        );
+
+        let state_root =
+            crate::execution::state_root::compute_state_root(&evm.ctx.journaled_state.database);
+
+        println!("State root: {}", state_root);
 
         let fail_tx = TxEnv::builder()
             .caller(deployer)
@@ -479,6 +515,8 @@ impl RevmExecutionEngine {
         SolidityCounterOutcome {
             contract_address,
             count,
+            state_root,
+            transactions: vec![deploy_tx, increment_tx],
             deploy_receipt,
             increment_receipt,
             read_receipt,
@@ -574,6 +612,11 @@ mod tests {
 
         let outcome = engine.deploy_increment_and_read_counter(deployer, U256::from(10_000_000));
 
+        let transactions_root =
+            crate::execution::transactions_root::compute_transactions_root(&outcome.transactions);
+
+        println!("Transactions root: {}", transactions_root);
+
         let receipts = vec![
             outcome.deploy_receipt.clone(),
             outcome.increment_receipt.clone(),
@@ -581,34 +624,143 @@ mod tests {
 
         let receipts_root = compute_receipts_root(&receipts);
 
-        let header = SolizoneBlockHeader {
-            version: 1,
-            chain_id: 9001,
-            height: 0,
-            parent_hash: B256::ZERO,
-            timestamp: 1_800_000_000,
+        let encoded_tx = outcome.transactions[1].encode_canonical();
 
-            // Still placeholders for now.
-            state_root: B256::ZERO,
-            transactions_root: B256::ZERO,
+        let decoded_tx =
+            SolizoneTransaction::decode_canonical(&encoded_tx).expect("transaction should decode");
 
-            // Real REVM-derived receipt commitment.
-            receipts_root,
+        assert_eq!(decoded_tx, outcome.transactions[1]);
 
-            gas_limit: 30_000_000,
+        println!(
+            "Transaction round-trip valid: {}",
+            decoded_tx == outcome.transactions[1]
+        );
 
-            gas_used: outcome.deploy_receipt.gas_used + outcome.increment_receipt.gas_used,
-        };
+        let block = crate::block_builder::build_block(
+            1,             // version
+            9001,          // chain_id
+            0,             // height
+            B256::ZERO,    // parent_hash
+            1_800_000_000, // timestamp
+            outcome.state_root,
+            &outcome.transactions,
+            &receipts,
+            30_000_000, // gas_limit
+        );
 
-        assert_eq!(header.encode().len(), 170);
+        let publication = crate::publisher::prepare_block_for_publication(&block);
 
-        assert_eq!(header.receipts_root, receipts_root);
+        assert_eq!(publication.block_hash, block.hash());
 
-        println!("Block receipts root: {}", header.receipts_root);
+        assert_eq!(publication.bytes, block.encode());
 
-        println!("Block gas used: {}", header.gas_used);
+        println!(
+            "Publication payload size: {} bytes",
+            publication.bytes.len()
+        );
 
-        println!("Block hash: {}", header.hash());
+        println!("Publication block hash: {}", publication.block_hash);
+
+        let encoded_header = block.header.encode();
+
+        let decoded_header = crate::block::SolizoneBlockHeader::decode(&encoded_header)
+            .expect("header should decode");
+
+        assert_eq!(decoded_header, block.header);
+
+        println!(
+            "Header round-trip valid: {}",
+            decoded_header == block.header
+        );
+
+        let encoded_block = block.encode();
+
+        let imported_block = crate::block::SolizoneBlock::decode_and_validate(&encoded_block)
+            .expect("encoded block should import");
+
+        assert_eq!(imported_block, block);
+
+        println!("Block import valid: {}", imported_block == block);
+
+        let mut tampered_bytes = encoded_block.clone();
+
+        // Flip one byte inside the last transaction.
+        let last = tampered_bytes.len() - 1;
+
+        tampered_bytes[last] ^= 0x01;
+
+        let tampered_import = crate::block::SolizoneBlock::decode_and_validate(&tampered_bytes);
+
+        println!("Tampered block import: {:?}", tampered_import);
+
+        assert!(tampered_import.is_err());
+
+        let decoded_block =
+            crate::block::SolizoneBlock::decode(&encoded_block).expect("block should decode");
+
+        assert_eq!(decoded_block, block);
+
+        assert!(decoded_block.validate().is_ok());
+
+        println!("Full block round-trip valid: {}", decoded_block == block);
+
+        println!("Decoded block validation: {:?}", decoded_block.validate());
+
+        let mut tampered_block = block.clone();
+
+        tampered_block.transactions[1].gas_limit += 1;
+
+        assert_eq!(&encoded_block[..4], b"SZB1");
+
+        assert_eq!(block.transactions.len(), 2);
+
+        assert!(block.validate_transactions_root());
+
+        assert!(!tampered_block.validate_transactions_root());
+
+        assert!(block.validate().is_ok());
+
+        assert_eq!(
+            tampered_block.validate(),
+            Err(crate::block::BlockValidationError::TransactionsRootMismatch)
+        );
+
+        println!(
+            "Block transactions valid: {}",
+            block.validate_transactions_root()
+        );
+
+        println!(
+            "Tampered block transactions valid: {}",
+            tampered_block.validate_transactions_root()
+        );
+
+        println!("Encoded block size: {} bytes", encoded_block.len());
+
+        println!("Full block hash: {}", block.hash());
+
+        println!("Full block validation: {:?}", block.validate());
+
+        println!("Tampered block validation: {:?}", tampered_block.validate());
+
+        assert_eq!(block.header.receipts_root, receipts_root);
+
+        assert_eq!(block.header.state_root, outcome.state_root);
+
+        assert_eq!(block.header.transactions_root, transactions_root);
+
+        assert_eq!(
+            block.header.gas_used,
+            outcome.deploy_receipt.gas_used + outcome.increment_receipt.gas_used
+        );
+
+        assert_eq!(block.header.encode().len(), 170);
+
+        println!("Block receipts root: {}", block.header.receipts_root);
+
+        println!("Block gas used: {}", block.header.gas_used);
+
+        println!("Block hash: {}", block.header.hash());
 
         let increment_proof =
             build_receipt_proof(&receipts, 1).expect("failed to build increment receipt proof");
@@ -680,5 +832,12 @@ mod tests {
         println!("Increment proof: {:?}", increment_proof);
 
         println!("Increment receipt proof valid: {}", proof_valid);
+
+        println!("Block state root: {}", block.header.state_root);
+
+        println!(
+            "Block transactions root: {}",
+            block.header.transactions_root
+        );
     }
 }

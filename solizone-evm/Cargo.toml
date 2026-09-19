@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lb-zone-sdk = { package = "logos-blockchain-zone-sdk", path = "../../logos-blockchain-basecamp-compat/zone-sdk" }
+lb-key-management-system-service = { package = "logos-blockchain-key-management-system-service", path = "../../logos-blockchain-basecamp-compat/services/key-management-system" }
+lb-groth16 = { package = "logos-blockchain-groth16", path = "../../logos-blockchain-basecamp-compat/zk/groth16" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 revm = "43.0.2"

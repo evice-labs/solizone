@@ -1,7 +1,5 @@
-mod block;
-mod execution;
+use solizone_evm::execution::RevmExecutionEngine;
 
-use execution::RevmExecutionEngine;
 use revm::primitives::{U256, address};
 
 fn main() {
@@ -24,9 +22,11 @@ fn main() {
 
     println!("=== Resulting State ===");
     println!("Sender balance:    {}", outcome.sender_balance);
+
     println!("Sender nonce:      {}", outcome.sender_nonce);
+
     println!("Recipient balance: {}", outcome.recipient_balance);
 
     println!();
-    println!("✅ Generic Solizone EVM transfer executed");
+    println!("Generic Solizone EVM transfer executed");
 }
