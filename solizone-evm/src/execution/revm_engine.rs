@@ -16,6 +16,8 @@ use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
 
+use crate::state::MemoryState;
+
 #[derive(Debug)]
 pub struct TransferOutcome {
     pub sender_balance: U256,
@@ -72,20 +74,19 @@ impl RevmExecutionEngine {
 
     pub fn execute_transfer(
         &self,
+        state: &mut MemoryState,
         sender: Address,
         recipient: Address,
-        sender_starting_balance: U256,
-        recipient_starting_balance: U256,
         value: U256,
     ) -> TransferOutcome {
-        let mut db = InMemoryDB::default();
-
-        db.insert_account_info(sender, AccountInfo::from_balance(sender_starting_balance));
-
-        db.insert_account_info(
-            recipient,
-            AccountInfo::from_balance(recipient_starting_balance),
-        );
+        let sender_nonce = state
+            .db()
+            .cache
+            .accounts
+            .get(&sender)
+            .and_then(|account| account.info())
+            .map(|info| info.nonce)
+            .unwrap_or(0);
 
         let tx = TxEnv::builder()
             .caller(sender)
@@ -94,31 +95,40 @@ impl RevmExecutionEngine {
             .gas_limit(21_000)
             .gas_price(0)
             .gas_priority_fee(None)
+            .nonce(sender_nonce)
             .build()
             .expect("failed to build transaction");
 
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+        let result = {
+            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
 
-        let output = evm.transact(tx).expect("EVM transaction failed");
+            evm.transact_commit(tx).expect("EVM transaction failed")
+        };
 
         println!("Execution result:");
-        println!("{:#?}", output.result);
+        println!("{:#?}", result);
         println!();
 
-        let sender_after = output
-            .state
+        let sender_after = state
+            .db()
+            .cache
+            .accounts
             .get(&sender)
+            .and_then(|account| account.info())
             .expect("sender missing from resulting state");
 
-        let recipient_after = output
-            .state
+        let recipient_after = state
+            .db()
+            .cache
+            .accounts
             .get(&recipient)
+            .and_then(|account| account.info())
             .expect("recipient missing from resulting state");
 
         TransferOutcome {
-            sender_balance: sender_after.info.balance,
-            sender_nonce: sender_after.info.nonce,
-            recipient_balance: recipient_after.info.balance,
+            sender_balance: sender_after.balance,
+            sender_nonce: sender_after.nonce,
+            recipient_balance: recipient_after.balance,
         }
     }
 
@@ -536,16 +546,15 @@ mod tests {
         let engine = RevmExecutionEngine::new();
 
         let alice = address!("1111111111111111111111111111111111111111");
-
         let bob = address!("2222222222222222222222222222222222222222");
 
-        let outcome = engine.execute_transfer(
-            alice,
-            bob,
-            U256::from(1_000_000),
-            U256::from(0),
-            U256::from(100),
-        );
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000_000)));
+
+        state.insert_account_info(bob, AccountInfo::from_balance(U256::ZERO));
+
+        let outcome = engine.execute_transfer(&mut state, alice, bob, U256::from(100));
 
         assert_eq!(outcome.sender_balance, U256::from(999_900));
         assert_eq!(outcome.sender_nonce, 1);
@@ -839,5 +848,44 @@ mod tests {
             "Block transactions root: {}",
             block.header.transactions_root
         );
+    }
+
+    #[test]
+    fn preserves_state_across_multiple_transfers() {
+        let engine = RevmExecutionEngine::new();
+
+        let alice = address!("1111111111111111111111111111111111111111");
+        let bob = address!("2222222222222222222222222222222222222222");
+        let charlie = address!("3333333333333333333333333333333333333333");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000_000)));
+
+        state.insert_account_info(bob, AccountInfo::from_balance(U256::ZERO));
+
+        state.insert_account_info(charlie, AccountInfo::from_balance(U256::ZERO));
+
+        let first = engine.execute_transfer(&mut state, alice, bob, U256::from(100));
+
+        assert_eq!(first.sender_balance, U256::from(999_900));
+        assert_eq!(first.sender_nonce, 1);
+        assert_eq!(first.recipient_balance, U256::from(100));
+
+        let second = engine.execute_transfer(&mut state, alice, charlie, U256::from(200));
+
+        assert_eq!(second.sender_balance, U256::from(999_700));
+        assert_eq!(second.sender_nonce, 2);
+        assert_eq!(second.recipient_balance, U256::from(200));
+
+        let bob_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&bob)
+            .and_then(|account| account.info())
+            .expect("Bob missing from state");
+
+        assert_eq!(bob_after.balance, U256::from(100));
     }
 }
