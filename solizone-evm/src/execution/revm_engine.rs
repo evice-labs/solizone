@@ -16,7 +16,7 @@ use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
 
-use crate::state::MemoryState;
+use crate::state::{MemoryState, StateSnapshot};
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -93,6 +93,34 @@ impl RevmExecutionEngine {
             let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
 
             evm.transact_commit(tx_env).expect("EVM transaction failed")
+        };
+
+        ExecutionReceipt::from_revm(&result)
+    }
+
+    pub fn execute_call(
+        &self,
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> ExecutionReceipt {
+        let tx_env = TxEnv::builder()
+            .caller(tx.sender)
+            .kind(tx.revm_kind())
+            .value(tx.value)
+            .data(tx.data.clone())
+            .gas_limit(tx.gas_limit)
+            .gas_price(0)
+            .gas_priority_fee(None)
+            .nonce(tx.nonce)
+            .build()
+            .expect("failed to build REVM call");
+
+        let result = {
+            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
+
+            let output = evm.transact(tx_env).expect("EVM call failed");
+
+            output.result
         };
 
         ExecutionReceipt::from_revm(&result)
@@ -907,5 +935,167 @@ mod tests {
             .expect("Bob missing from state");
 
         assert_eq!(bob_after.balance, U256::from(100));
+    }
+
+    #[test]
+    fn executes_counter_through_generic_transaction_executor() {
+        let engine = RevmExecutionEngine::new();
+
+        let deployer = address!("1111111111111111111111111111111111111111");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(deployer, AccountInfo::from_balance(U256::from(10_000_000)));
+
+        // TX #1 — deploy the compiled Solidity Counter
+        let deploy_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 0,
+            kind: TransactionKind::Create,
+            value: U256::ZERO,
+            data: counter_creation_bytecode(),
+            gas_limit: 500_000,
+        };
+
+        let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
+
+        assert_eq!(deploy_receipt.status, ExecutionStatus::Success);
+
+        let contract_address = deploy_receipt
+            .contract_address
+            .expect("Counter deployment returned no contract address");
+
+        // TX #2 — increment()
+        let increment_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 1,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[
+                0xd0, 0x9d, 0xe0, 0x8a, // increment()
+            ]),
+            gas_limit: 100_000,
+        };
+
+        let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
+
+        assert_eq!(increment_receipt.status, ExecutionStatus::Success);
+
+        assert_eq!(increment_receipt.contract_address, None);
+
+        // Read count() without committing state.
+        let read_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 2,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[
+                0x06, 0x66, 0x1a, 0xbd, // count()
+            ]),
+            gas_limit: 100_000,
+        };
+
+        let read_receipt = engine.execute_call(&mut state, &read_tx);
+
+        assert_eq!(read_receipt.status, ExecutionStatus::Success);
+
+        let count = U256::from_be_slice(read_receipt.output.as_ref());
+
+        assert_eq!(count, U256::from(1));
+
+        // Snapshot the current EVM state.
+
+        let snapshot = state.snapshot();
+
+        let encoded_snapshot = snapshot
+            .encode_json()
+            .expect("failed to encode state snapshot");
+
+        let decoded_snapshot =
+            StateSnapshot::decode_json(&encoded_snapshot).expect("failed to decode state snapshot");
+
+        assert_eq!(decoded_snapshot, snapshot);
+
+        println!("Encoded snapshot size: {} bytes", encoded_snapshot.len());
+
+        let counter_snapshot = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.address == contract_address)
+            .expect("Counter missing from snapshot");
+
+        assert!(
+            counter_snapshot.code.is_some(),
+            "Counter bytecode missing from snapshot"
+        );
+
+        let counter_slot_zero = counter_snapshot
+            .storage
+            .iter()
+            .find(|slot| slot.key == U256::ZERO)
+            .expect("Counter storage slot 0 missing from snapshot");
+
+        assert_eq!(counter_slot_zero.value, U256::from(1));
+
+        let deployer_snapshot = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.address == deployer)
+            .expect("deployer missing from snapshot");
+
+        assert_eq!(deployer_snapshot.nonce, 2);
+
+        // Verify the ORIGINAL state before destroying it.
+
+        let deployer_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&deployer)
+            .and_then(|account| account.info())
+            .expect("deployer missing from state");
+
+        assert_eq!(deployer_after.nonce, 2);
+
+        let contract_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&contract_address)
+            .and_then(|account| account.info())
+            .expect("Counter contract missing from state");
+
+        assert_ne!(contract_after.code_hash, B256::ZERO);
+
+        println!("Counter value: {}", count);
+        println!("Snapshot accounts: {}", snapshot.accounts.len());
+        println!("Counter snapshot storage[0]: {}", counter_slot_zero.value);
+        println!("Counter address: {}", contract_address);
+        println!("Deployer nonce: {}", deployer_after.nonce);
+        println!("Counter code hash: {}", contract_after.code_hash);
+
+        // Simulate restart.
+        //
+        // Destroy the original REVM database and rebuild an entirely
+        // new MemoryState from the snapshot.
+
+        drop(state);
+
+        let mut restored_state = MemoryState::from_snapshot(decoded_snapshot);
+
+        // Read count() from the RESTORED state.
+
+        let restored_read_receipt = engine.execute_call(&mut restored_state, &read_tx);
+
+        assert_eq!(restored_read_receipt.status, ExecutionStatus::Success);
+
+        let restored_count = U256::from_be_slice(restored_read_receipt.output.as_ref());
+
+        assert_eq!(restored_count, U256::from(1));
+
+        println!("Counter value after state restore: {}", restored_count);
+
+        println!("Deploy receipt: {:?}", deploy_receipt);
+        println!("Increment receipt: {:?}", increment_receipt);
     }
 }

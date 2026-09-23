@@ -12,3 +12,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 revm = "43.0.2"
+revm-bytecode = "43.0.0"
+serde = { version = "1", features = ["derive"] }
