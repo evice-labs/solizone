@@ -72,6 +72,32 @@ impl RevmExecutionEngine {
         Self
     }
 
+    pub fn execute_transaction(
+        &self,
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> ExecutionReceipt {
+        let tx_env = TxEnv::builder()
+            .caller(tx.sender)
+            .kind(tx.revm_kind())
+            .value(tx.value)
+            .data(tx.data.clone())
+            .gas_limit(tx.gas_limit)
+            .gas_price(0)
+            .gas_priority_fee(None)
+            .nonce(tx.nonce)
+            .build()
+            .expect("failed to build REVM transaction");
+
+        let result = {
+            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
+
+            evm.transact_commit(tx_env).expect("EVM transaction failed")
+        };
+
+        ExecutionReceipt::from_revm(&result)
+    }
+
     pub fn execute_transfer(
         &self,
         state: &mut MemoryState,
@@ -88,25 +114,19 @@ impl RevmExecutionEngine {
             .map(|info| info.nonce)
             .unwrap_or(0);
 
-        let tx = TxEnv::builder()
-            .caller(sender)
-            .kind(TxKind::Call(recipient))
-            .value(value)
-            .gas_limit(21_000)
-            .gas_price(0)
-            .gas_priority_fee(None)
-            .nonce(sender_nonce)
-            .build()
-            .expect("failed to build transaction");
-
-        let result = {
-            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
-
-            evm.transact_commit(tx).expect("EVM transaction failed")
+        let tx = SolizoneTransaction {
+            sender,
+            nonce: sender_nonce,
+            kind: TransactionKind::Call(recipient),
+            value,
+            data: Bytes::new(),
+            gas_limit: 21_000,
         };
 
-        println!("Execution result:");
-        println!("{:#?}", result);
+        let receipt = self.execute_transaction(state, &tx);
+
+        println!("Execution receipt:");
+        println!("{:#?}", receipt);
         println!();
 
         let sender_after = state
