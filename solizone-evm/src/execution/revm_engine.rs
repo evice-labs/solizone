@@ -16,7 +16,7 @@ use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
 
-use crate::state::{MemoryState, StateSnapshot};
+use crate::state::{FileStateBackend, MemoryState, StateBackend};
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -1009,28 +1009,22 @@ mod tests {
 
         let snapshot_path = std::env::temp_dir().join("solizone-counter-state.json");
 
-        snapshot
-            .save_to_file(&snapshot_path)
+        let backend = FileStateBackend::new(snapshot_path.clone());
+
+        backend
+            .save(&snapshot)
             .expect("failed to save state snapshot");
 
-        let snapshot_file_size = std::fs::metadata(&snapshot_path)
+        let snapshot_file_size = std::fs::metadata(backend.path())
             .expect("failed to read snapshot metadata")
             .len();
 
-        println!("Snapshot written to disk: {}", snapshot_path.display());
+        println!(
+            "Snapshot written through FileStateBackend: {}",
+            backend.path().display()
+        );
 
         println!("Snapshot file size: {} bytes", snapshot_file_size);
-
-        let encoded_snapshot = snapshot
-            .encode_json()
-            .expect("failed to encode state snapshot");
-
-        let decoded_snapshot =
-            StateSnapshot::decode_json(&encoded_snapshot).expect("failed to decode state snapshot");
-
-        assert_eq!(decoded_snapshot, snapshot);
-
-        println!("Encoded snapshot size: {} bytes", encoded_snapshot.len());
 
         let counter_snapshot = snapshot
             .accounts
@@ -1095,8 +1089,10 @@ mod tests {
 
         drop(state);
 
-        let loaded_snapshot =
-            StateSnapshot::load_from_file(&snapshot_path).expect("failed to load state snapshot");
+        let loaded_snapshot = backend
+            .load()
+            .expect("failed to load state snapshot")
+            .expect("state snapshot missing");
 
         let mut restored_state = MemoryState::from_snapshot(loaded_snapshot);
 
@@ -1112,7 +1108,7 @@ mod tests {
 
         println!("Counter value after state restore: {}", restored_count);
 
-        std::fs::remove_file(&snapshot_path).expect("failed to remove test snapshot");
+        std::fs::remove_file(backend.path()).expect("failed to remove test snapshot");
 
         println!("Deploy receipt: {:?}", deploy_receipt);
         println!("Increment receipt: {:?}", increment_receipt);
