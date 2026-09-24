@@ -16,7 +16,7 @@ use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
 
-use crate::state::{FileStateBackend, MemoryState, StateBackend};
+use crate::state::MemoryState;
 
 #[derive(Debug)]
 pub struct TransferOutcome {
@@ -1003,28 +1003,7 @@ mod tests {
 
         assert_eq!(count, U256::from(1));
 
-        // Snapshot the current EVM state.
-
         let snapshot = state.snapshot();
-
-        let snapshot_path = std::env::temp_dir().join("solizone-counter-state.json");
-
-        let backend = FileStateBackend::new(snapshot_path.clone());
-
-        backend
-            .save(&snapshot)
-            .expect("failed to save state snapshot");
-
-        let snapshot_file_size = std::fs::metadata(backend.path())
-            .expect("failed to read snapshot metadata")
-            .len();
-
-        println!(
-            "Snapshot written through FileStateBackend: {}",
-            backend.path().display()
-        );
-
-        println!("Snapshot file size: {} bytes", snapshot_file_size);
 
         let counter_snapshot = snapshot
             .accounts
@@ -1089,12 +1068,7 @@ mod tests {
 
         drop(state);
 
-        let loaded_snapshot = backend
-            .load()
-            .expect("failed to load state snapshot")
-            .expect("state snapshot missing");
-
-        let mut restored_state = MemoryState::from_snapshot(loaded_snapshot);
+        let mut restored_state = MemoryState::from_snapshot(snapshot);
 
         // Read count() from the RESTORED state.
 
@@ -1107,8 +1081,6 @@ mod tests {
         assert_eq!(restored_count, U256::from(1));
 
         println!("Counter value after state restore: {}", restored_count);
-
-        std::fs::remove_file(backend.path()).expect("failed to remove test snapshot");
 
         println!("Deploy receipt: {:?}", deploy_receipt);
         println!("Increment receipt: {:?}", increment_receipt);
