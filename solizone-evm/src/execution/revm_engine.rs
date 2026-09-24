@@ -55,6 +55,12 @@ pub struct SolidityCounterOutcome {
     pub halt_receipt: ExecutionReceipt,
 }
 
+#[derive(Debug)]
+pub struct BlockExecutionOutcome {
+    pub receipts: Vec<ExecutionReceipt>,
+    pub state_root: B256,
+}
+
 pub struct RevmExecutionEngine;
 
 fn counter_creation_bytecode() -> Bytes {
@@ -582,6 +588,27 @@ impl RevmExecutionEngine {
             halt_receipt,
         }
     }
+
+    pub fn execute_block(
+        &self,
+        state: &mut MemoryState,
+        transactions: &[SolizoneTransaction],
+    ) -> BlockExecutionOutcome {
+        let mut receipts = Vec::with_capacity(transactions.len());
+
+        for tx in transactions {
+            let receipt = self.execute_transaction(state, tx);
+
+            receipts.push(receipt);
+        }
+
+        let state_root = state.state_root();
+
+        BlockExecutionOutcome {
+            receipts,
+            state_root,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1084,5 +1111,116 @@ mod tests {
 
         println!("Deploy receipt: {:?}", deploy_receipt);
         println!("Increment receipt: {:?}", increment_receipt);
+    }
+
+    #[test]
+    fn generic_execution_changes_state_root() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(1000)));
+
+        let root_before = state.state_root();
+
+        let tx = SolizoneTransaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(100),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+
+        let receipt = engine.execute_transaction(&mut state, &tx);
+
+        let root_after = state.state_root();
+
+        assert_ne!(
+            root_before, root_after,
+            "state root should change after committed execution"
+        );
+
+        assert_eq!(
+            state
+                .db()
+                .cache
+                .accounts
+                .get(&sender)
+                .expect("sender missing")
+                .info
+                .nonce,
+            1,
+        );
+
+        println!("State root before: {}", root_before);
+        println!("State root after:  {}", root_after);
+        println!("Gas used: {}", receipt.gas_used);
+    }
+
+    #[test]
+    fn executes_ordered_transactions_as_block() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        let root_before = state.state_root();
+
+        let transactions = vec![
+            SolizoneTransaction {
+                sender,
+                nonce: 0,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(100),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+            SolizoneTransaction {
+                sender,
+                nonce: 1,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(200),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+        ];
+
+        let outcome = engine.execute_block(&mut state, &transactions);
+
+        assert_eq!(outcome.receipts.len(), 2);
+
+        assert_ne!(root_before, outcome.state_root,);
+
+        assert_eq!(
+            outcome.state_root,
+            state.state_root(),
+            "block outcome must contain final post-block state root"
+        );
+
+        assert_eq!(
+            state
+                .db()
+                .cache
+                .accounts
+                .get(&sender)
+                .expect("sender missing")
+                .info
+                .nonce,
+            2,
+        );
+
+        println!("Pre-block state root:  {}", root_before);
+
+        println!("Post-block state root: {}", outcome.state_root);
+
+        println!("Executed transactions: {}", outcome.receipts.len());
     }
 }

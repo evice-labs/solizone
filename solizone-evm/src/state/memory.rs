@@ -5,6 +5,7 @@ use revm::{
 };
 
 use crate::state::snapshot::{AccountSnapshot, StateSnapshot, StorageSlotSnapshot};
+use revm::primitives::B256;
 use revm_bytecode::Bytecode;
 
 pub struct MemoryState {
@@ -105,6 +106,10 @@ impl MemoryState {
         }
 
         state
+    }
+
+    pub fn state_root(&self) -> B256 {
+        crate::execution::state_root::compute_state_root(&self.db)
     }
 }
 
