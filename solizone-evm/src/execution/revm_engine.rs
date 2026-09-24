@@ -1007,6 +1007,20 @@ mod tests {
 
         let snapshot = state.snapshot();
 
+        let snapshot_path = std::env::temp_dir().join("solizone-counter-state.json");
+
+        snapshot
+            .save_to_file(&snapshot_path)
+            .expect("failed to save state snapshot");
+
+        let snapshot_file_size = std::fs::metadata(&snapshot_path)
+            .expect("failed to read snapshot metadata")
+            .len();
+
+        println!("Snapshot written to disk: {}", snapshot_path.display());
+
+        println!("Snapshot file size: {} bytes", snapshot_file_size);
+
         let encoded_snapshot = snapshot
             .encode_json()
             .expect("failed to encode state snapshot");
@@ -1081,7 +1095,10 @@ mod tests {
 
         drop(state);
 
-        let mut restored_state = MemoryState::from_snapshot(decoded_snapshot);
+        let loaded_snapshot =
+            StateSnapshot::load_from_file(&snapshot_path).expect("failed to load state snapshot");
+
+        let mut restored_state = MemoryState::from_snapshot(loaded_snapshot);
 
         // Read count() from the RESTORED state.
 
@@ -1094,6 +1111,8 @@ mod tests {
         assert_eq!(restored_count, U256::from(1));
 
         println!("Counter value after state restore: {}", restored_count);
+
+        std::fs::remove_file(&snapshot_path).expect("failed to remove test snapshot");
 
         println!("Deploy receipt: {:?}", deploy_receipt);
         println!("Increment receipt: {:?}", increment_receipt);

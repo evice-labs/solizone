@@ -1,5 +1,6 @@
 use revm::primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
+use std::{fs, path::Path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
@@ -130,5 +131,17 @@ impl StateSnapshot {
             .collect::<Result<Vec<_>, String>>()?;
 
         Ok(Self { accounts })
+    }
+
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let json = self.encode_json()?;
+
+        fs::write(path, json).map_err(|error| error.to_string())
+    }
+
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, String> {
+        let json = fs::read_to_string(path).map_err(|error| error.to_string())?;
+
+        Self::decode_json(&json)
     }
 }
