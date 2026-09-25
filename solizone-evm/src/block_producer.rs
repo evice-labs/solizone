@@ -90,6 +90,8 @@ mod tests {
 
     use crate::execution::transaction::{SolizoneTransaction, TransactionKind};
 
+    use crate::{block_store::BlockStore, memory_block_store::MemoryBlockStore};
+
     #[test]
     fn produces_linked_blocks_automatically() {
         let engine = RevmExecutionEngine::new();
@@ -490,15 +492,27 @@ mod tests {
 
     #[test]
     fn resumes_full_node_from_disk_checkpoint() {
-        use crate::state::{FileCheckpointBackend, SolizoneCheckpoint};
+        use crate::{
+            block_store::BlockStore,
+            file_block_store::FileBlockStore,
+            state::{FileCheckpointBackend, SolizoneCheckpoint},
+        };
 
         let checkpoint_path = std::env::temp_dir().join("solizone-full-restart-test.json");
+
+        let block_directory = std::env::temp_dir().join("solizone-full-restart-blocks");
 
         if checkpoint_path.exists() {
             std::fs::remove_file(&checkpoint_path).expect("failed to remove old checkpoint");
         }
 
+        if block_directory.exists() {
+            std::fs::remove_dir_all(&block_directory).expect("failed to remove old block history");
+        }
+
         let backend = FileCheckpointBackend::new(checkpoint_path);
+
+        let mut block_store = FileBlockStore::new(&block_directory);
 
         let engine = RevmExecutionEngine::new();
 
@@ -531,6 +545,9 @@ mod tests {
 
         let block_0 = producer.produce_block(&engine, &mut state, &transactions_0, 1_800_000_000);
 
+        block_store
+            .insert(block_0.clone())
+            .expect("failed to persist block #0");
         /*
          * BLOCK #1
          */
@@ -546,6 +563,11 @@ mod tests {
 
         let block_1 = producer.produce_block(&engine, &mut state, &transactions_1, 1_800_000_001);
 
+        block_store
+            .insert(block_1.clone())
+            .expect("failed to persist block #1");
+
+        assert_eq!(block_store.len().unwrap(), 2,);
         /*
          * Build ONE consistent checkpoint.
          */
@@ -573,6 +595,7 @@ mod tests {
         drop(checkpoint);
         drop(state);
         drop(producer);
+        drop(block_store);
 
         /*
          * Simulate fresh process loading from disk.
@@ -582,6 +605,34 @@ mod tests {
             .load()
             .expect("failed to load checkpoint")
             .expect("checkpoint missing");
+
+        let mut restored_block_store = FileBlockStore::new(&block_directory);
+
+        /*
+         * Canonical history must survive
+         * the process restart too.
+         */
+
+        assert_eq!(restored_block_store.len().unwrap(), 2,);
+
+        let recovered_block_0 = restored_block_store
+            .get_by_height(0)
+            .unwrap()
+            .expect("block #0 missing after restart");
+
+        let recovered_block_1 = restored_block_store
+            .get_by_height(1)
+            .unwrap()
+            .expect("block #1 missing after restart");
+
+        assert_eq!(recovered_block_0.hash(), block_0.hash(),);
+
+        assert_eq!(recovered_block_1.hash(), block_1.hash(),);
+
+        assert_eq!(
+            recovered_block_1.header.parent_hash,
+            recovered_block_0.hash(),
+        );
 
         let mut restored_state = MemoryState::from_snapshot(recovered_checkpoint.state);
 
@@ -617,6 +668,36 @@ mod tests {
             &mut restored_state,
             &transactions_2,
             1_800_000_002,
+        );
+
+        restored_block_store
+            .insert(block_2.clone())
+            .expect("failed to persist block #2");
+
+        /*
+         * Verify canonical history also
+         * advanced after recovery.
+         */
+
+        assert_eq!(restored_block_store.len().unwrap(), 3,);
+
+        let stored_block_2 = restored_block_store
+            .get_by_height(2)
+            .unwrap()
+            .expect("block #2 missing from history");
+
+        assert_eq!(stored_block_2.hash(), block_2.hash(),);
+
+        assert_eq!(stored_block_2.header.parent_hash, recovered_block_1.hash(),);
+
+        assert_eq!(
+            restored_block_store
+                .get_by_hash(block_2.hash())
+                .unwrap()
+                .expect("block #2 missing by hash",)
+                .header
+                .height,
+            2,
         );
 
         /*
@@ -677,6 +758,104 @@ mod tests {
 
         println!("Recipient balance: {}", recipient_account.balance);
 
+        println!(
+            "Recovered canonical history: {} blocks",
+            restored_block_store.len().unwrap()
+        );
+
         std::fs::remove_file(backend.path()).expect("failed to remove checkpoint");
+
+        std::fs::remove_dir_all(&block_directory).expect("failed to remove block history");
+    }
+
+    #[test]
+    fn stores_produced_blocks_in_canonical_history() {
+        let engine = RevmExecutionEngine::new();
+
+        let mut state = MemoryState::new();
+
+        let mut producer = BlockProducer::new(1, 9001, 30_000_000);
+
+        let mut block_store = MemoryBlockStore::new();
+
+        /*
+         * Produce block #0.
+         */
+
+        let block_0 = producer.produce_block(&engine, &mut state, &[], 1_800_000_000);
+
+        let block_0_hash = block_0.hash();
+
+        block_store.insert(block_0).unwrap();
+
+        /*
+         * Produce block #1.
+         */
+
+        let block_1 = producer.produce_block(&engine, &mut state, &[], 1_800_000_001);
+
+        let block_1_hash = block_1.hash();
+
+        block_store.insert(block_1).unwrap();
+
+        /*
+         * Both produced blocks should now
+         * exist in canonical history.
+         */
+
+        assert_eq!(block_store.len().unwrap(), 2,);
+
+        let stored_0 = block_store
+            .get_by_height(0)
+            .unwrap()
+            .expect("block #0 missing");
+
+        let stored_1 = block_store
+            .get_by_height(1)
+            .unwrap()
+            .expect("block #1 missing");
+
+        assert_eq!(stored_0.hash(), block_0_hash,);
+
+        assert_eq!(stored_1.hash(), block_1_hash,);
+
+        /*
+         * Parent linkage must survive storage.
+         */
+
+        assert_eq!(stored_1.header.parent_hash, block_0_hash,);
+
+        /*
+         * Hash lookup must return the
+         * same canonical blocks.
+         */
+
+        assert_eq!(
+            block_store
+                .get_by_hash(block_0_hash)
+                .unwrap()
+                .expect("block #0 missing by hash")
+                .header
+                .height,
+            0,
+        );
+
+        assert_eq!(
+            block_store
+                .get_by_hash(block_1_hash)
+                .unwrap()
+                .expect("block #1 missing by hash")
+                .header
+                .height,
+            1,
+        );
+
+        println!("Block #0: {}", block_0_hash);
+
+        println!("Block #1: {}", block_1_hash);
+
+        println!("Block #1 parent: {}", stored_1.header.parent_hash);
+
+        println!("Canonical history length: {}", block_store.len().unwrap());
     }
 }
