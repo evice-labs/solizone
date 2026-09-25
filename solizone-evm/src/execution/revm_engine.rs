@@ -1114,6 +1114,121 @@ mod tests {
     }
 
     #[test]
+    fn contract_state_root_survives_snapshot_restore() {
+        let engine = RevmExecutionEngine::new();
+
+        let deployer = address!("1111111111111111111111111111111111111111");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(deployer, AccountInfo::from_balance(U256::from(10_000_000)));
+
+        // TX #1 — deploy Counter
+        let deploy_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 0,
+            kind: TransactionKind::Create,
+            value: U256::ZERO,
+            data: counter_creation_bytecode(),
+            gas_limit: 500_000,
+        };
+
+        let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
+
+        assert_eq!(deploy_receipt.status, ExecutionStatus::Success,);
+
+        let contract_address = deploy_receipt
+            .contract_address
+            .expect("Counter deployment returned no address");
+
+        // TX #2 — increment Counter to 1
+        let increment_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 1,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]),
+            gas_limit: 100_000,
+        };
+
+        let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
+
+        assert_eq!(increment_receipt.status, ExecutionStatus::Success,);
+
+        // Protocol root before restart.
+        let root_before = state.state_root();
+
+        // Simulate persistence + process restart.
+        let snapshot = state.snapshot();
+
+        drop(state);
+
+        let mut restored = MemoryState::from_snapshot(snapshot);
+
+        // Protocol root must remain identical.
+        let root_after = restored.state_root();
+
+        assert_eq!(
+            root_before, root_after,
+            "contract state root changed after snapshot restore"
+        );
+
+        // Read count() from reconstructed state.
+        let read_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 2,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[0x06, 0x66, 0x1a, 0xbd]),
+            gas_limit: 100_000,
+        };
+
+        let read_receipt = engine.execute_call(&mut restored, &read_tx);
+
+        assert_eq!(read_receipt.status, ExecutionStatus::Success,);
+
+        let count = U256::from_be_slice(read_receipt.output.as_ref());
+
+        assert_eq!(
+            count,
+            U256::from(1),
+            "Counter storage was not restored correctly"
+        );
+
+        // Contract bytecode must also exist after restart.
+        let contract = restored
+            .db()
+            .cache
+            .accounts
+            .get(&contract_address)
+            .and_then(|account| account.info())
+            .expect("restored Counter account missing");
+
+        let code = contract
+            .code
+            .as_ref()
+            .expect("restored Counter bytecode missing");
+
+        assert!(
+            !code.original_bytes().is_empty(),
+            "restored Counter bytecode is empty"
+        );
+
+        println!("Contract address:          {}", contract_address);
+
+        println!("State root before restart: {}", root_before);
+
+        println!("State root after restart:  {}", root_after);
+
+        println!("Counter after restart:     {}", count);
+
+        println!(
+            "Runtime bytecode size:     {} bytes",
+            code.original_bytes().len()
+        );
+    }
+
+    #[test]
     fn generic_execution_changes_state_root() {
         let engine = RevmExecutionEngine::new();
         let mut state = MemoryState::new();
@@ -1222,5 +1337,225 @@ mod tests {
         println!("Post-block state root: {}", outcome.state_root);
 
         println!("Executed transactions: {}", outcome.receipts.len());
+    }
+
+    #[test]
+    fn builds_canonical_block_from_generic_execution() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        let transactions = vec![
+            SolizoneTransaction {
+                sender,
+                nonce: 0,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(100),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+            SolizoneTransaction {
+                sender,
+                nonce: 1,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(200),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+        ];
+
+        let outcome = engine.execute_block(&mut state, &transactions);
+
+        let block = crate::block_builder::build_block(
+            1,
+            9001,
+            0,
+            B256::ZERO,
+            1_800_000_000,
+            outcome.state_root,
+            &transactions,
+            &outcome.receipts,
+            30_000_000,
+        );
+
+        assert_eq!(block.header.state_root, outcome.state_root,);
+
+        assert_eq!(
+            block.header.transactions_root,
+            crate::execution::transactions_root::compute_transactions_root(&transactions,),
+        );
+
+        assert_eq!(
+            block.header.receipts_root,
+            crate::execution::receipts_root::compute_receipts_root(&outcome.receipts,),
+        );
+
+        let expected_gas_used: u64 = outcome
+            .receipts
+            .iter()
+            .map(|receipt| receipt.gas_used)
+            .sum();
+
+        assert_eq!(block.header.gas_used, expected_gas_used,);
+
+        block
+            .validate()
+            .expect("execution-backed block should be valid");
+
+        println!("Block state root:        {}", block.header.state_root);
+
+        println!(
+            "Block transactions root: {}",
+            block.header.transactions_root
+        );
+
+        println!("Block receipts root:     {}", block.header.receipts_root);
+
+        println!("Block gas used:          {}", block.header.gas_used);
+
+        println!("Block hash:              {}", block.hash());
+    }
+
+    #[test]
+    fn progresses_state_across_linked_blocks() {
+        let engine = RevmExecutionEngine::new();
+
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        /*
+         * ============================================================
+         * BLOCK #0
+         * ============================================================
+         */
+
+        let block_0_transactions = vec![SolizoneTransaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(100),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        }];
+
+        let outcome_0 = engine.execute_block(&mut state, &block_0_transactions);
+
+        let block_0 = crate::block_builder::build_block(
+            1,
+            9001,
+            0,
+            B256::ZERO,
+            1_800_000_000,
+            outcome_0.state_root,
+            &block_0_transactions,
+            &outcome_0.receipts,
+            30_000_000,
+        );
+
+        block_0.validate().expect("block #0 should be valid");
+
+        let block_0_hash = block_0.hash();
+
+        /*
+         * ============================================================
+         * BLOCK #1
+         * ============================================================
+         */
+
+        let block_1_transactions = vec![SolizoneTransaction {
+            sender,
+            nonce: 1,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(200),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        }];
+
+        let outcome_1 = engine.execute_block(&mut state, &block_1_transactions);
+
+        let block_1 = crate::block_builder::build_block(
+            1,
+            9001,
+            1,
+            block_0_hash,
+            1_800_000_001,
+            outcome_1.state_root,
+            &block_1_transactions,
+            &outcome_1.receipts,
+            30_000_000,
+        );
+
+        block_1.validate().expect("block #1 should be valid");
+
+        /*
+         * ============================================================
+         * CHAIN INVARIANTS
+         * ============================================================
+         */
+
+        assert_eq!(block_0.header.height, 0,);
+
+        assert_eq!(block_0.header.parent_hash, B256::ZERO,);
+
+        assert_eq!(block_1.header.height, 1,);
+
+        assert_eq!(block_1.header.parent_hash, block_0.hash(),);
+
+        assert_ne!(
+            block_0.header.state_root, block_1.header.state_root,
+            "state root should change after block #1 execution"
+        );
+
+        assert_eq!(block_1.header.state_root, state.state_root(),);
+
+        /*
+         * Sender executed two transactions across two blocks.
+         */
+        let sender_account = state
+            .db()
+            .cache
+            .accounts
+            .get(&sender)
+            .and_then(|account| account.info())
+            .expect("sender missing");
+
+        assert_eq!(sender_account.nonce, 2,);
+
+        /*
+         * Recipient received 100 + 200.
+         */
+        let recipient_account = state
+            .db()
+            .cache
+            .accounts
+            .get(&recipient)
+            .and_then(|account| account.info())
+            .expect("recipient missing");
+
+        assert_eq!(recipient_account.balance, U256::from(300),);
+
+        println!("Block #0 hash:       {}", block_0.hash());
+
+        println!("Block #0 state root: {}", block_0.header.state_root);
+
+        println!("Block #1 parent:     {}", block_1.header.parent_hash);
+
+        println!("Block #1 hash:       {}", block_1.hash());
+
+        println!("Block #1 state root: {}", block_1.header.state_root);
+
+        println!("Final sender nonce:  {}", sender_account.nonce);
+
+        println!("Recipient balance:   {}", recipient_account.balance);
     }
 }

@@ -208,4 +208,42 @@ mod tests {
         println!("Canonical snapshot determinism verified.");
         println!("Encoded snapshot size: {} bytes", encoded_a.len());
     }
+
+    #[test]
+    fn state_root_survives_snapshot_restore() {
+        let mut state = MemoryState::new();
+
+        let account = Address::from([0x11; 20]);
+
+        state.insert_account_info(
+            account,
+            AccountInfo::from_balance(revm::primitives::U256::from(1000)),
+        );
+
+        state
+            .db_mut()
+            .insert_account_storage(
+                account,
+                revm::primitives::U256::ZERO,
+                revm::primitives::U256::from(42),
+            )
+            .expect("failed to insert storage");
+
+        let root_before = state.state_root();
+
+        let snapshot = state.snapshot();
+
+        let restored = MemoryState::from_snapshot(snapshot);
+
+        let root_after = restored.state_root();
+
+        println!("State root before restart: {}", root_before);
+
+        println!("State root after restart:  {}", root_after);
+
+        assert_eq!(
+            root_before, root_after,
+            "protocol state root changed after snapshot restore"
+        );
+    }
 }
