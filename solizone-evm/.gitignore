@@ -5,3 +5,8 @@
 /contracts/Counter.creation.hex
 /contracts/Counter.runtime.hex
 /.state/
+/storage-data
+solizone-config.json
+storage-config.json
+hello-solizone-downloaded.txt
+hello-solizone.txt
