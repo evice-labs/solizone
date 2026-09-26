@@ -16,6 +16,8 @@ use crate::execution::receipts_root::{
     build_receipt_proof, compute_receipts_root, verify_receipt_proof,
 };
 
+use crate::state::MemoryState;
+
 #[derive(Debug)]
 pub struct TransferOutcome {
     pub sender_balance: U256,
@@ -53,6 +55,12 @@ pub struct SolidityCounterOutcome {
     pub halt_receipt: ExecutionReceipt,
 }
 
+#[derive(Debug)]
+pub struct BlockExecutionOutcome {
+    pub receipts: Vec<ExecutionReceipt>,
+    pub state_root: B256,
+}
+
 pub struct RevmExecutionEngine;
 
 fn counter_creation_bytecode() -> Bytes {
@@ -70,55 +78,111 @@ impl RevmExecutionEngine {
         Self
     }
 
-    pub fn execute_transfer(
+    pub fn execute_transaction(
         &self,
-        sender: Address,
-        recipient: Address,
-        sender_starting_balance: U256,
-        recipient_starting_balance: U256,
-        value: U256,
-    ) -> TransferOutcome {
-        let mut db = InMemoryDB::default();
-
-        db.insert_account_info(sender, AccountInfo::from_balance(sender_starting_balance));
-
-        db.insert_account_info(
-            recipient,
-            AccountInfo::from_balance(recipient_starting_balance),
-        );
-
-        let tx = TxEnv::builder()
-            .caller(sender)
-            .kind(TxKind::Call(recipient))
-            .value(value)
-            .gas_limit(21_000)
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> ExecutionReceipt {
+        let tx_env = TxEnv::builder()
+            .caller(tx.sender)
+            .kind(tx.revm_kind())
+            .value(tx.value)
+            .data(tx.data.clone())
+            .gas_limit(tx.gas_limit)
             .gas_price(0)
             .gas_priority_fee(None)
+            .nonce(tx.nonce)
             .build()
-            .expect("failed to build transaction");
+            .expect("failed to build REVM transaction");
 
-        let mut evm = Context::mainnet().with_db(db).build_mainnet();
+        let result = {
+            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
 
-        let output = evm.transact(tx).expect("EVM transaction failed");
+            evm.transact_commit(tx_env).expect("EVM transaction failed")
+        };
 
-        println!("Execution result:");
-        println!("{:#?}", output.result);
+        ExecutionReceipt::from_revm(&result)
+    }
+
+    pub fn execute_call(
+        &self,
+        state: &mut MemoryState,
+        tx: &SolizoneTransaction,
+    ) -> ExecutionReceipt {
+        let tx_env = TxEnv::builder()
+            .caller(tx.sender)
+            .kind(tx.revm_kind())
+            .value(tx.value)
+            .data(tx.data.clone())
+            .gas_limit(tx.gas_limit)
+            .gas_price(0)
+            .gas_priority_fee(None)
+            .nonce(tx.nonce)
+            .build()
+            .expect("failed to build REVM call");
+
+        let result = {
+            let mut evm = Context::mainnet().with_db(state.db_mut()).build_mainnet();
+
+            let output = evm.transact(tx_env).expect("EVM call failed");
+
+            output.result
+        };
+
+        ExecutionReceipt::from_revm(&result)
+    }
+
+    pub fn execute_transfer(
+        &self,
+        state: &mut MemoryState,
+        sender: Address,
+        recipient: Address,
+        value: U256,
+    ) -> TransferOutcome {
+        let sender_nonce = state
+            .db()
+            .cache
+            .accounts
+            .get(&sender)
+            .and_then(|account| account.info())
+            .map(|info| info.nonce)
+            .unwrap_or(0);
+
+        let tx = SolizoneTransaction {
+            sender,
+            nonce: sender_nonce,
+            kind: TransactionKind::Call(recipient),
+            value,
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+
+        let receipt = self.execute_transaction(state, &tx);
+
+        println!("Execution receipt:");
+        println!("{:#?}", receipt);
         println!();
 
-        let sender_after = output
-            .state
+        let sender_after = state
+            .db()
+            .cache
+            .accounts
             .get(&sender)
+            .and_then(|account| account.info())
             .expect("sender missing from resulting state");
 
-        let recipient_after = output
-            .state
+        let recipient_after = state
+            .db()
+            .cache
+            .accounts
             .get(&recipient)
+            .and_then(|account| account.info())
             .expect("recipient missing from resulting state");
 
         TransferOutcome {
-            sender_balance: sender_after.info.balance,
-            sender_nonce: sender_after.info.nonce,
-            recipient_balance: recipient_after.info.balance,
+            sender_balance: sender_after.balance,
+            sender_nonce: sender_after.nonce,
+            recipient_balance: recipient_after.balance,
         }
     }
 
@@ -524,6 +588,27 @@ impl RevmExecutionEngine {
             halt_receipt,
         }
     }
+
+    pub fn execute_block(
+        &self,
+        state: &mut MemoryState,
+        transactions: &[SolizoneTransaction],
+    ) -> BlockExecutionOutcome {
+        let mut receipts = Vec::with_capacity(transactions.len());
+
+        for tx in transactions {
+            let receipt = self.execute_transaction(state, tx);
+
+            receipts.push(receipt);
+        }
+
+        let state_root = state.state_root();
+
+        BlockExecutionOutcome {
+            receipts,
+            state_root,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,16 +621,15 @@ mod tests {
         let engine = RevmExecutionEngine::new();
 
         let alice = address!("1111111111111111111111111111111111111111");
-
         let bob = address!("2222222222222222222222222222222222222222");
 
-        let outcome = engine.execute_transfer(
-            alice,
-            bob,
-            U256::from(1_000_000),
-            U256::from(0),
-            U256::from(100),
-        );
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000_000)));
+
+        state.insert_account_info(bob, AccountInfo::from_balance(U256::ZERO));
+
+        let outcome = engine.execute_transfer(&mut state, alice, bob, U256::from(100));
 
         assert_eq!(outcome.sender_balance, U256::from(999_900));
         assert_eq!(outcome.sender_nonce, 1);
@@ -839,5 +923,639 @@ mod tests {
             "Block transactions root: {}",
             block.header.transactions_root
         );
+    }
+
+    #[test]
+    fn preserves_state_across_multiple_transfers() {
+        let engine = RevmExecutionEngine::new();
+
+        let alice = address!("1111111111111111111111111111111111111111");
+        let bob = address!("2222222222222222222222222222222222222222");
+        let charlie = address!("3333333333333333333333333333333333333333");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(alice, AccountInfo::from_balance(U256::from(1_000_000)));
+
+        state.insert_account_info(bob, AccountInfo::from_balance(U256::ZERO));
+
+        state.insert_account_info(charlie, AccountInfo::from_balance(U256::ZERO));
+
+        let first = engine.execute_transfer(&mut state, alice, bob, U256::from(100));
+
+        assert_eq!(first.sender_balance, U256::from(999_900));
+        assert_eq!(first.sender_nonce, 1);
+        assert_eq!(first.recipient_balance, U256::from(100));
+
+        let second = engine.execute_transfer(&mut state, alice, charlie, U256::from(200));
+
+        assert_eq!(second.sender_balance, U256::from(999_700));
+        assert_eq!(second.sender_nonce, 2);
+        assert_eq!(second.recipient_balance, U256::from(200));
+
+        let bob_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&bob)
+            .and_then(|account| account.info())
+            .expect("Bob missing from state");
+
+        assert_eq!(bob_after.balance, U256::from(100));
+    }
+
+    #[test]
+    fn executes_counter_through_generic_transaction_executor() {
+        let engine = RevmExecutionEngine::new();
+
+        let deployer = address!("1111111111111111111111111111111111111111");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(deployer, AccountInfo::from_balance(U256::from(10_000_000)));
+
+        // TX #1 — deploy the compiled Solidity Counter
+        let deploy_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 0,
+            kind: TransactionKind::Create,
+            value: U256::ZERO,
+            data: counter_creation_bytecode(),
+            gas_limit: 500_000,
+        };
+
+        let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
+
+        assert_eq!(deploy_receipt.status, ExecutionStatus::Success);
+
+        let contract_address = deploy_receipt
+            .contract_address
+            .expect("Counter deployment returned no contract address");
+
+        // TX #2 — increment()
+        let increment_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 1,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[
+                0xd0, 0x9d, 0xe0, 0x8a, // increment()
+            ]),
+            gas_limit: 100_000,
+        };
+
+        let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
+
+        assert_eq!(increment_receipt.status, ExecutionStatus::Success);
+
+        assert_eq!(increment_receipt.contract_address, None);
+
+        // Read count() without committing state.
+        let read_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 2,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[
+                0x06, 0x66, 0x1a, 0xbd, // count()
+            ]),
+            gas_limit: 100_000,
+        };
+
+        let read_receipt = engine.execute_call(&mut state, &read_tx);
+
+        assert_eq!(read_receipt.status, ExecutionStatus::Success);
+
+        let count = U256::from_be_slice(read_receipt.output.as_ref());
+
+        assert_eq!(count, U256::from(1));
+
+        let snapshot = state.snapshot();
+
+        let counter_snapshot = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.address == contract_address)
+            .expect("Counter missing from snapshot");
+
+        assert!(
+            counter_snapshot.code.is_some(),
+            "Counter bytecode missing from snapshot"
+        );
+
+        let counter_slot_zero = counter_snapshot
+            .storage
+            .iter()
+            .find(|slot| slot.key == U256::ZERO)
+            .expect("Counter storage slot 0 missing from snapshot");
+
+        assert_eq!(counter_slot_zero.value, U256::from(1));
+
+        let deployer_snapshot = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.address == deployer)
+            .expect("deployer missing from snapshot");
+
+        assert_eq!(deployer_snapshot.nonce, 2);
+
+        // Verify the ORIGINAL state before destroying it.
+
+        let deployer_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&deployer)
+            .and_then(|account| account.info())
+            .expect("deployer missing from state");
+
+        assert_eq!(deployer_after.nonce, 2);
+
+        let contract_after = state
+            .db()
+            .cache
+            .accounts
+            .get(&contract_address)
+            .and_then(|account| account.info())
+            .expect("Counter contract missing from state");
+
+        assert_ne!(contract_after.code_hash, B256::ZERO);
+
+        println!("Counter value: {}", count);
+        println!("Snapshot accounts: {}", snapshot.accounts.len());
+        println!("Counter snapshot storage[0]: {}", counter_slot_zero.value);
+        println!("Counter address: {}", contract_address);
+        println!("Deployer nonce: {}", deployer_after.nonce);
+        println!("Counter code hash: {}", contract_after.code_hash);
+
+        // Simulate restart.
+        //
+        // Destroy the original REVM database and rebuild an entirely
+        // new MemoryState from the snapshot.
+
+        drop(state);
+
+        let mut restored_state = MemoryState::from_snapshot(snapshot);
+
+        // Read count() from the RESTORED state.
+
+        let restored_read_receipt = engine.execute_call(&mut restored_state, &read_tx);
+
+        assert_eq!(restored_read_receipt.status, ExecutionStatus::Success);
+
+        let restored_count = U256::from_be_slice(restored_read_receipt.output.as_ref());
+
+        assert_eq!(restored_count, U256::from(1));
+
+        println!("Counter value after state restore: {}", restored_count);
+
+        println!("Deploy receipt: {:?}", deploy_receipt);
+        println!("Increment receipt: {:?}", increment_receipt);
+    }
+
+    #[test]
+    fn contract_state_root_survives_snapshot_restore() {
+        let engine = RevmExecutionEngine::new();
+
+        let deployer = address!("1111111111111111111111111111111111111111");
+
+        let mut state = MemoryState::new();
+
+        state.insert_account_info(deployer, AccountInfo::from_balance(U256::from(10_000_000)));
+
+        // TX #1 — deploy Counter
+        let deploy_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 0,
+            kind: TransactionKind::Create,
+            value: U256::ZERO,
+            data: counter_creation_bytecode(),
+            gas_limit: 500_000,
+        };
+
+        let deploy_receipt = engine.execute_transaction(&mut state, &deploy_tx);
+
+        assert_eq!(deploy_receipt.status, ExecutionStatus::Success,);
+
+        let contract_address = deploy_receipt
+            .contract_address
+            .expect("Counter deployment returned no address");
+
+        // TX #2 — increment Counter to 1
+        let increment_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 1,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[0xd0, 0x9d, 0xe0, 0x8a]),
+            gas_limit: 100_000,
+        };
+
+        let increment_receipt = engine.execute_transaction(&mut state, &increment_tx);
+
+        assert_eq!(increment_receipt.status, ExecutionStatus::Success,);
+
+        // Protocol root before restart.
+        let root_before = state.state_root();
+
+        // Simulate persistence + process restart.
+        let snapshot = state.snapshot();
+
+        drop(state);
+
+        let mut restored = MemoryState::from_snapshot(snapshot);
+
+        // Protocol root must remain identical.
+        let root_after = restored.state_root();
+
+        assert_eq!(
+            root_before, root_after,
+            "contract state root changed after snapshot restore"
+        );
+
+        // Read count() from reconstructed state.
+        let read_tx = SolizoneTransaction {
+            sender: deployer,
+            nonce: 2,
+            kind: TransactionKind::Call(contract_address),
+            value: U256::ZERO,
+            data: Bytes::from_static(&[0x06, 0x66, 0x1a, 0xbd]),
+            gas_limit: 100_000,
+        };
+
+        let read_receipt = engine.execute_call(&mut restored, &read_tx);
+
+        assert_eq!(read_receipt.status, ExecutionStatus::Success,);
+
+        let count = U256::from_be_slice(read_receipt.output.as_ref());
+
+        assert_eq!(
+            count,
+            U256::from(1),
+            "Counter storage was not restored correctly"
+        );
+
+        // Contract bytecode must also exist after restart.
+        let contract = restored
+            .db()
+            .cache
+            .accounts
+            .get(&contract_address)
+            .and_then(|account| account.info())
+            .expect("restored Counter account missing");
+
+        let code = contract
+            .code
+            .as_ref()
+            .expect("restored Counter bytecode missing");
+
+        assert!(
+            !code.original_bytes().is_empty(),
+            "restored Counter bytecode is empty"
+        );
+
+        println!("Contract address:          {}", contract_address);
+
+        println!("State root before restart: {}", root_before);
+
+        println!("State root after restart:  {}", root_after);
+
+        println!("Counter after restart:     {}", count);
+
+        println!(
+            "Runtime bytecode size:     {} bytes",
+            code.original_bytes().len()
+        );
+    }
+
+    #[test]
+    fn generic_execution_changes_state_root() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(1000)));
+
+        let root_before = state.state_root();
+
+        let tx = SolizoneTransaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(100),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        };
+
+        let receipt = engine.execute_transaction(&mut state, &tx);
+
+        let root_after = state.state_root();
+
+        assert_ne!(
+            root_before, root_after,
+            "state root should change after committed execution"
+        );
+
+        assert_eq!(
+            state
+                .db()
+                .cache
+                .accounts
+                .get(&sender)
+                .expect("sender missing")
+                .info
+                .nonce,
+            1,
+        );
+
+        println!("State root before: {}", root_before);
+        println!("State root after:  {}", root_after);
+        println!("Gas used: {}", receipt.gas_used);
+    }
+
+    #[test]
+    fn executes_ordered_transactions_as_block() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        let root_before = state.state_root();
+
+        let transactions = vec![
+            SolizoneTransaction {
+                sender,
+                nonce: 0,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(100),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+            SolizoneTransaction {
+                sender,
+                nonce: 1,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(200),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+        ];
+
+        let outcome = engine.execute_block(&mut state, &transactions);
+
+        assert_eq!(outcome.receipts.len(), 2);
+
+        assert_ne!(root_before, outcome.state_root,);
+
+        assert_eq!(
+            outcome.state_root,
+            state.state_root(),
+            "block outcome must contain final post-block state root"
+        );
+
+        assert_eq!(
+            state
+                .db()
+                .cache
+                .accounts
+                .get(&sender)
+                .expect("sender missing")
+                .info
+                .nonce,
+            2,
+        );
+
+        println!("Pre-block state root:  {}", root_before);
+
+        println!("Post-block state root: {}", outcome.state_root);
+
+        println!("Executed transactions: {}", outcome.receipts.len());
+    }
+
+    #[test]
+    fn builds_canonical_block_from_generic_execution() {
+        let engine = RevmExecutionEngine::new();
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        let transactions = vec![
+            SolizoneTransaction {
+                sender,
+                nonce: 0,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(100),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+            SolizoneTransaction {
+                sender,
+                nonce: 1,
+                kind: TransactionKind::Call(recipient),
+                value: U256::from(200),
+                data: Bytes::new(),
+                gas_limit: 21_000,
+            },
+        ];
+
+        let outcome = engine.execute_block(&mut state, &transactions);
+
+        let block = crate::block_builder::build_block(
+            1,
+            9001,
+            0,
+            B256::ZERO,
+            1_800_000_000,
+            outcome.state_root,
+            &transactions,
+            &outcome.receipts,
+            30_000_000,
+        );
+
+        assert_eq!(block.header.state_root, outcome.state_root,);
+
+        assert_eq!(
+            block.header.transactions_root,
+            crate::execution::transactions_root::compute_transactions_root(&transactions,),
+        );
+
+        assert_eq!(
+            block.header.receipts_root,
+            crate::execution::receipts_root::compute_receipts_root(&outcome.receipts,),
+        );
+
+        let expected_gas_used: u64 = outcome
+            .receipts
+            .iter()
+            .map(|receipt| receipt.gas_used)
+            .sum();
+
+        assert_eq!(block.header.gas_used, expected_gas_used,);
+
+        block
+            .validate()
+            .expect("execution-backed block should be valid");
+
+        println!("Block state root:        {}", block.header.state_root);
+
+        println!(
+            "Block transactions root: {}",
+            block.header.transactions_root
+        );
+
+        println!("Block receipts root:     {}", block.header.receipts_root);
+
+        println!("Block gas used:          {}", block.header.gas_used);
+
+        println!("Block hash:              {}", block.hash());
+    }
+
+    #[test]
+    fn progresses_state_across_linked_blocks() {
+        let engine = RevmExecutionEngine::new();
+
+        let mut state = MemoryState::new();
+
+        let sender = address!("1111111111111111111111111111111111111111");
+
+        let recipient = address!("2222222222222222222222222222222222222222");
+
+        state.insert_account_info(sender, AccountInfo::from_balance(U256::from(10_000)));
+
+        /*
+         * ============================================================
+         * BLOCK #0
+         * ============================================================
+         */
+
+        let block_0_transactions = vec![SolizoneTransaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(100),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        }];
+
+        let outcome_0 = engine.execute_block(&mut state, &block_0_transactions);
+
+        let block_0 = crate::block_builder::build_block(
+            1,
+            9001,
+            0,
+            B256::ZERO,
+            1_800_000_000,
+            outcome_0.state_root,
+            &block_0_transactions,
+            &outcome_0.receipts,
+            30_000_000,
+        );
+
+        block_0.validate().expect("block #0 should be valid");
+
+        let block_0_hash = block_0.hash();
+
+        /*
+         * ============================================================
+         * BLOCK #1
+         * ============================================================
+         */
+
+        let block_1_transactions = vec![SolizoneTransaction {
+            sender,
+            nonce: 1,
+            kind: TransactionKind::Call(recipient),
+            value: U256::from(200),
+            data: Bytes::new(),
+            gas_limit: 21_000,
+        }];
+
+        let outcome_1 = engine.execute_block(&mut state, &block_1_transactions);
+
+        let block_1 = crate::block_builder::build_block(
+            1,
+            9001,
+            1,
+            block_0_hash,
+            1_800_000_001,
+            outcome_1.state_root,
+            &block_1_transactions,
+            &outcome_1.receipts,
+            30_000_000,
+        );
+
+        block_1.validate().expect("block #1 should be valid");
+
+        /*
+         * ============================================================
+         * CHAIN INVARIANTS
+         * ============================================================
+         */
+
+        assert_eq!(block_0.header.height, 0,);
+
+        assert_eq!(block_0.header.parent_hash, B256::ZERO,);
+
+        assert_eq!(block_1.header.height, 1,);
+
+        assert_eq!(block_1.header.parent_hash, block_0.hash(),);
+
+        assert_ne!(
+            block_0.header.state_root, block_1.header.state_root,
+            "state root should change after block #1 execution"
+        );
+
+        assert_eq!(block_1.header.state_root, state.state_root(),);
+
+        /*
+         * Sender executed two transactions across two blocks.
+         */
+        let sender_account = state
+            .db()
+            .cache
+            .accounts
+            .get(&sender)
+            .and_then(|account| account.info())
+            .expect("sender missing");
+
+        assert_eq!(sender_account.nonce, 2,);
+
+        /*
+         * Recipient received 100 + 200.
+         */
+        let recipient_account = state
+            .db()
+            .cache
+            .accounts
+            .get(&recipient)
+            .and_then(|account| account.info())
+            .expect("recipient missing");
+
+        assert_eq!(recipient_account.balance, U256::from(300),);
+
+        println!("Block #0 hash:       {}", block_0.hash());
+
+        println!("Block #0 state root: {}", block_0.header.state_root);
+
+        println!("Block #1 parent:     {}", block_1.header.parent_hash);
+
+        println!("Block #1 hash:       {}", block_1.hash());
+
+        println!("Block #1 state root: {}", block_1.header.state_root);
+
+        println!("Final sender nonce:  {}", sender_account.nonce);
+
+        println!("Recipient balance:   {}", recipient_account.balance);
     }
 }
