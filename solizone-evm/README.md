@@ -1,10 +1,10 @@
 # solizone-evm
 
-**The active Rust implementation of the Solizone execution layer and its current Logos publication path.**
+**The active Rust implementation of the Solizone EVM execution layer, persistent local chain state, and current Logos publication path.**
 
-`solizone-evm` executes Solidity contracts through REVM, packages the resulting execution data into a canonical Solizone block, publishes that block as a Logos inscription, and observes the publication reaching Logos finality.
+`solizone-evm` executes Solidity/EVM transactions through REVM, maintains recoverable EVM state, produces parent-linked canonical Solizone blocks, stores canonical block history locally, publishes canonical block bytes through the Logos Zone SDK, and can observe publication reaching Logos finality.
 
-The project has moved beyond the original REVM value-transfer proof.
+The current `feat/second-phase` branch has moved beyond the original single-execution proof into a **stateful, restartable, block-producing execution prototype**.
 
 > ⚠️ **Disclaimer:** Solizone is an independent research prototype and is **not an official Logos project**.
 
@@ -14,25 +14,23 @@ The project has moved beyond the original REVM value-transfer proof.
 
 - [What works today](#what-works-today)
 - [Status](#status)
-- [Current end-to-end flow](#current-end-to-end-flow)
-- [Architecture boundary](#architecture-boundary)
-- [Proven execution-backed publication](#proven-execution-backed-publication)
-- [Logos terminology](#logos-terminology)
-- [Checkpoint reconciliation](#checkpoint-reconciliation)
+- [Current architecture](#current-architecture)
+- [Execution and state](#execution-and-state)
+- [Persistent state and recovery](#persistent-state-and-recovery)
+- [Block production and canonical history](#block-production-and-canonical-history)
 - [Canonical Solizone block](#canonical-solizone-block)
 - [Transaction model](#transaction-model)
 - [Receipts](#receipts)
-- [State root](#state-root)
-- [Solidity contract](#solidity-contract)
+- [State commitments](#state-commitments)
+- [Logos blockchain publication](#logos-blockchain-publication)
+- [Logos publication checkpoint](#logos-publication-checkpoint)
+- [Logos Storage direction](#logos-storage-direction)
 - [Repository structure](#repository-structure)
 - [Module responsibilities](#module-responsibilities)
-- [Dependencies](#dependencies)
 - [Build, run, test](#build-run-test)
-- [Block publisher CLI](#block-publisher-cli)
-- [Publication lifecycle](#publication-lifecycle)
-- [Relationship to earlier experiments](#relationship-to-earlier-experiments)
+- [Publisher CLI](#publisher-cli)
 - [Current limitations](#current-limitations)
-- [Development principle](#development-principle)
+- [Development principles](#development-principles)
 - [Roadmap](#roadmap)
 - [Useful commands](#useful-commands)
 - [Related documentation](#related-documentation)
@@ -43,16 +41,33 @@ The project has moved beyond the original REVM value-transfer proof.
 
 The current prototype can:
 
-- execute Solidity contracts through REVM
-- derive execution-backed Solizone transactions
-- produce receipts
-- compute state / transaction / receipt commitments
-- build a canonical Solizone block
-- serialize it into the `SZB1` block format
-- publish that block through the Logos Zone SDK
-- persist publication checkpoints
-- resume interrupted publication state
-- observe the resulting Logos transaction reaching finality
+- execute generic EVM transactions through REVM
+- deploy and call compiled Solidity contracts
+- mutate and read contract storage
+- preserve accounts, balances, nonces, bytecode, and storage across transactions
+- execute ordered transaction batches as a block
+- produce execution receipts
+- compute deterministic state, transaction, and receipt commitments
+- build canonical `SZB1` Solizone blocks
+- produce parent-linked multi-block chains
+- persist deterministic EVM-state snapshots
+- restore a fresh REVM state from persisted snapshots
+- persist a combined execution checkpoint containing state + next block height + parent hash
+- resume block production from a persisted chain head
+- store canonical block history in memory or on disk
+- retrieve persisted blocks by height or hash
+- recover EVM state + block producer + canonical block history after a complete process restart
+- continue execution with the next correctly linked block after restart
+- publish an execution-backed canonical Solizone block through the Logos Zone SDK
+- persist and resume Logos `ZoneSequencer` publication state
+- observe a published Solizone block reaching Logos finality
+
+At the latest second-phase milestone, the full Rust test suite reports:
+
+```text
+29 passed
+0 failed
+```
 
 ---
 
@@ -60,308 +75,567 @@ The current prototype can:
 
 ### Implemented and proven
 
-| Area | Capability | |
+| Area | Capability | Status |
 | --- | --- | --- |
 | Execution | REVM integration | ✅ |
-| Execution | In-memory EVM state | ✅ |
 | Execution | Generic EVM value transfer | ✅ |
 | Execution | Solidity contract deployment | ✅ |
-| Execution | Contract call | ✅ |
+| Execution | Contract calls | ✅ |
 | Execution | Contract storage mutation | ✅ |
-| Receipts | Success execution receipt | ✅ |
-| Receipts | Revert execution receipt | ✅ |
-| Receipts | Halt / gas-limit execution receipt | ✅ |
-| Receipts | Receipt encoding | ✅ |
+| Execution | Read-only contract execution | ✅ |
+| Execution | Ordered transaction-batch execution | ✅ |
+| State | Shared in-memory EVM state | ✅ |
+| State | Deterministic state snapshot | ✅ |
+| State | Snapshot → fresh REVM reconstruction | ✅ |
+| State | JSON snapshot round trip | ✅ |
+| State | File-backed snapshot persistence | ✅ |
+| State | State-root continuity after restore | ✅ |
+| Recovery | `SolizoneCheckpoint` | ✅ |
+| Recovery | File-backed checkpoint save/load | ✅ |
+| Recovery | Full EVM-state restart recovery | ✅ |
+| Recovery | Continue execution after restart | ✅ |
 | Transactions | Canonical Solizone transaction encoding | ✅ |
 | Transactions | Transaction hashing | ✅ |
 | Transactions | Transactions root | ✅ |
-| Commitments | Deterministic prototype state root | ✅ |
-| Commitments | Receipts root | ✅ |
+| Receipts | Success / revert / halt receipts | ✅ |
+| Receipts | Canonical receipt encoding | ✅ |
+| Receipts | Receipts root | ✅ |
+| Commitments | Deterministic Solizone protocol state root | ✅ |
+| Commitments | Deterministic snapshot commitment | ✅ |
 | Block | Canonical Solizone block format | ✅ |
-| Block | Canonical block encoding / decoding | ✅ |
-| Block | Transaction-root block validation | ✅ |
+| Block | Canonical encoding / decoding | ✅ |
+| Block | Transaction-root validation | ✅ |
 | Block | Block builder | ✅ |
-| Publication | Publisher abstraction | ✅ |
-| Publication | Logos publisher integration | ✅ |
+| Chain | `BlockProducer` abstraction | ✅ |
+| Chain | Parent-linked multi-block production | ✅ |
+| Chain | Producer resume from chain head | ✅ |
+| Chain | `BlockStore` abstraction | ✅ |
+| Chain | `MemoryBlockStore` | ✅ |
+| Chain | `FileBlockStore` | ✅ |
+| Chain | Block lookup by height | ✅ |
+| Chain | Block lookup by hash | ✅ |
+| Chain | Canonical replacement semantics | ✅ |
+| Chain | Durable block-history recovery | ✅ |
+| Integration | Full restart: state + producer + block history | ✅ |
+| Publication | Generic publisher abstraction | ✅ |
+| Publication | Logos publisher adapter | ✅ |
 | Publication | Logos Zone SDK connection | ✅ |
 | Publication | Sequencer checkpoint persistence | ✅ |
-| Publication | Sequencer resume / recovery | ✅ |
+| Publication | Sequencer resume / reconciliation | ✅ |
 | Finality | Execution-backed block publication to Logos | ✅ |
 | Finality | Logos block inclusion | ✅ |
 | Finality | Logos LIB / finality proof | ✅ |
-| Finality | Checkpoint cleanup after finalization | ✅ |
 
 ### Not implemented yet
 
-| Area | Capability | |
+| Area | Capability | Status |
 | --- | --- | --- |
-| State | Persistent EVM state across restarts | ⏳ |
+| Storage | Logos Storage backend | ⏳ |
 | Ethereum tx layer | Raw signed Ethereum transactions | ⏳ |
-| Ethereum tx layer | Ethereum signature recovery | ⏳ |
-| Ethereum tx layer | Ethereum fee validation | ⏳ |
+| Ethereum tx layer | EIP-2718 / RLP transaction decoding | ⏳ |
+| Ethereum tx layer | secp256k1 signature recovery | ⏳ |
+| Ethereum tx layer | Ethereum fee handling | ⏳ |
 | Ethereum tx layer | Transaction admission rules | ⏳ |
 | Node surface | Ethereum JSON-RPC | ⏳ |
 | Node surface | Transaction pool | ⏳ |
-| Chain | Persistent Solizone chain storage | ⏳ |
-| Chain | Multi-block parent linkage | ⏳ |
-| Chain | Long-running block producer | ⏳ |
+| Node runtime | Long-running block-production service | ⏳ |
 | Validation | Full state re-execution validation | ⏳ |
 | Validation | Full receipt re-execution validation | ⏳ |
-| Compatibility | Ethereum-compatible MPT state roots | ⏳ |
+| Compatibility | Ethereum MPT state roots | ⏳ |
+| Durability | Atomic checkpoint + block commit | ⏳ |
+| Chain indexing | Persistent hash index | ⏳ |
 | Operations | Production publisher service | ⏳ |
 
 ### What the current milestone proves
 
-Solizone can execute EVM state transitions locally, package the resulting execution data into its own canonical block, publish that block as a Logos inscription, and observe that publication reaching Logos finality.
-
----
-
-## Current end-to-end flow
+Solizone can now:
 
 ```text
-Forge-built Solidity bytecode
-compiled by Solc 0.8.20
+execute EVM state transitions
         ↓
-REVM deployment
+advance deterministic state
         ↓
-Counter contract created
+produce parent-linked canonical blocks
         ↓
-increment() executed
+persist execution state + chain head
         ↓
-contract storage changes
+persist canonical block history
         ↓
-Solizone transactions produced
+stop completely
         ↓
-execution receipts produced
+restore state + producer + history
         ↓
-transactions_root
-receipts_root
-state_root
+continue with the next correctly linked block
+```
+
+Separately, the existing Logos publication path has already proven:
+
+```text
+execution-backed Solizone block
         ↓
-canonical Solizone block
+canonical SZB1 bytes
         ↓
-SZB1 canonical bytes
-        ↓
-Logos ZoneSequencer
-        ↓
-Mantle channel inscription
+Logos inscription
         ↓
 Logos block inclusion
         ↓
 LIB / finality
 ```
 
-The EVM executes **inside Solizone**. Logos does not execute the Solidity contract or interpret Solizone's EVM state.
-
-**Solizone owns:** execution, accounts, balances, contract bytecode, contract storage, transactions, receipts, gas accounting, state commitments, block semantics.
-
-**Logos currently provides:** publication, shared ordering, channel sequencing, consensus, data availability, finality — for the canonical Solizone block bytes.
-
 ---
 
-## Architecture boundary
+## Current architecture
 
-The intended architecture remains:
+The implementation now has three intentionally separated responsibilities:
+
+1. **EVM execution**
+2. **Solizone persistence / chain history**
+3. **Logos publication / finality**
 
 ```text
-Ethereum tooling
-      ↓
-Ethereum JSON-RPC
-      ↓
-Solizone transaction pool
-      ↓
-Solizone block producer
-      ↓
+Solidity / Solizone transaction
+        ↓
 REVM
-      ↓
-Solizone state
-      ↓
+        ↓
+MemoryState
+(accounts / balances / nonces / code / storage)
+        ↓
+receipts + final state
+        ↓
+state_root / transactions_root / receipts_root
+        ↓
+BlockProducer
+        ↓
+parent-linked canonical Solizone block
+        │
+        ├──────────── local persistence ─────────────┐
+        │                                             │
+        ↓                                             ↓
+SolizoneCheckpoint                               BlockStore
+state + next_height + parent_hash               canonical blocks
+        │                                             │
+        ↓                                             ↓
+FileCheckpointBackend                          FileBlockStore
+checkpoint.json                                0.szb / 1.szb / 2.szb
+        │                                             │
+        └──────────── restart recovery ───────────────┘
+                              ↓
+                       continue block N+1
+
 canonical Solizone block
-      ↓
-BlockPublisher interface
-      ↓
-Logos publisher
-      ↓
-Logos Zone SDK
-      ↓
-Mantle channel
-      ↓
-Logos ordering / finality
+        ↓
+BlockPublisher
+        ↓
+LogosPublisher
+        ↓
+Logos ZoneSequencer
+        ↓
+Mantle channel inscription
+        ↓
+Logos ordering / block inclusion
+        ↓
+LIB / finality
 ```
 
-The important design rule:
+### Architecture boundary
 
-> **Keep EVM execution and Logos publication separate.**
-> REVM should not know how Logos works.
-> The publisher should not determine EVM execution semantics.
+**Solizone owns:**
+
+- EVM execution
+- accounts and balances
+- nonces
+- contract bytecode
+- contract storage
+- transaction semantics
+- execution receipts
+- gas accounting
+- state commitments
+- block semantics
+- local execution checkpoints
+- canonical Solizone block history
+
+**Logos blockchain currently provides:**
+
+- publication of canonical Solizone bytes
+- shared ordering
+- channel sequencing
+- consensus
+- data availability for the publication path
+- finality
+
+The EVM executes **inside Solizone**. Logos does not execute Solidity contracts or interpret Solizone's EVM state.
 
 ---
 
-## Proven execution-backed publication
+## Execution and state
 
-The currently reproduced canonical Solizone block:
+The active execution engine is built on REVM.
 
-| Field | Value |
-| --- | --- |
-| Solizone block height | `0` |
-| Transactions | `2` |
-| Gas used | `223126` |
-| Payload size | `975` bytes |
+The main execution path accepts a `SolizoneTransaction`, executes it against `MemoryState`, commits REVM changes, and returns an `ExecutionReceipt`.
 
-**Solizone block hash**
+For block execution:
 
 ```text
-0xaafe6fe8137374388925d6fc2038da9f36b88cb7ae31c51f7f92ae3e6247e540
-```
-
-**Execution commitments**
-
-```text
-state_root
-0xc98e732117ebb7054dc0ac4b79ae64095bc8b79c1bdffc2fb6e2453e0ee142b7
-
-transactions_root
-0x9edd2a6e48d3c88679a390e39dafd06aab7fb437aad4b1c657e725cc0740e77d
-
-receipts_root
-0x5f8eefd86c5f2218ae4282cc6a9b434bd7aec83a7fd7c6b374a2a68870871d9
-```
-
-**Logos Mantle transaction carrying the block**
-
-```text
-d8c72874c1df3d3a5533f32c9e404874c9541131ae9b84b588df2b2739abda5b
-```
-
-**Included in Logos block**
-
-```text
-block id
-d05e25841617681c23c2114950de5ad4ef7d3ca5864a79f32f43ce175ab3cb49
-
-slot
-1318018
-```
-
-That block later became the Logos LIB, so the publication reached Logos finality.
-
-### Proof that the actual Solizone block was published
-
-The Logos transaction inscription begins with:
-
-```text
-53 5a 42 31
-```
-
-which is ASCII `SZB1` — the canonical Solizone block magic.
-
-The inscription also contains the same execution commitments produced locally (`state_root`, `transactions_root`, `receipts_root`). This verifies that the Logos transaction contains the execution-backed canonical Solizone block, rather than an unrelated publication test payload.
-
----
-
-## Logos terminology
-
-### Slot
-
-A Logos slot is a consensus-time position or opportunity in which a block may be produced:
-
-```text
-slot 1
-slot 2
-slot 3
-slot 4
+transactions[]
+      ↓
+execute transaction 0
+      ↓
+state changes
+      ↓
+execute transaction 1
+      ↓
+state changes
+      ↓
 ...
+      ↓
+final MemoryState
+      ↓
+protocol state_root
+      ↓
+BlockExecutionOutcome
+  ├── receipts
+  └── state_root
 ```
 
-A block does not necessarily have to exist for every possible slot.
+### Current state owner
 
-### Block number / block height
+`MemoryState` wraps REVM's in-memory database and is the active owner of local EVM state.
 
-Block height counts blocks that were actually produced:
+Conceptually:
 
 ```text
-block 100
-block 101
-block 102
+MemoryState
+│
+├── EOA accounts
+│   ├── balance
+│   └── nonce
+│
+└── contract accounts
+    ├── balance
+    ├── nonce
+    ├── runtime bytecode
+    └── storage slots
 ```
 
-So:
-
-```text
-slot         = consensus-time position
-block height = produced-block sequence
-```
-
-They are not the same concept.
-
-### LIB
-
-LIB means **Last Irreversible Block** — the latest Logos block considered irreversible / finalized by the protocol.
-
-For the proven Solizone publication:
-
-```text
-transaction d8c728...
-        ↓
-included in block d05e258...
-        ↓
-block slot 1318018
-        ↓
-that block became LIB
-        ↓
-publication finalized
-```
-
-The LIB later advanced beyond slot `1318018`. That is expected — once LIB moves forward, previously finalized blocks remain part of finalized history.
+The important change in the second phase is that this live state is no longer treated as disposable process memory. It can now be snapshotted, persisted, reconstructed, and continued.
 
 ---
 
-## Checkpoint reconciliation
+## Persistent state and recovery
 
-`ZoneSequencer` stores a local checkpoint containing fields such as `last_msg_id`, `pending_txs`, `lib`, and `lib_slot`.
+### Deterministic `StateSnapshot`
 
-The file used by `solizone-evm` is:
+`MemoryState::snapshot()` produces a persistence-friendly representation containing account state, bytecode, and storage.
 
 ```text
-.state/sequencer-checkpoint.json
+StateSnapshot
+└── accounts[]
+    ├── address
+    ├── balance
+    ├── nonce
+    ├── code
+    └── storage[]
+        ├── key
+        └── value
 ```
 
-On restart:
+Accounts and storage slots are sorted before snapshot output. This makes the persisted representation deterministic even if state was inserted in a different order.
+
+A fresh process can reconstruct active REVM state through:
 
 ```text
-load checkpoint
-      ↓
-connect to Logos
-      ↓
-backfill Logos history
-      ↓
-compare local pending state
-with canonical Logos history
-      ↓
-update checkpoint
+persisted StateSnapshot
+        ↓
+MemoryState::from_snapshot(...)
+        ↓
+fresh REVM database
+        ↓
+continue execution
 ```
 
-For the first execution-backed publication the checkpoint initially contained `pending_txs = 1`, because the publication had been created locally. After Logos finalized the transaction and the sequencer caught up:
+This has been tested with both synthetic account state and a real deployed Solidity `Counter` contract, including bytecode and contract storage continuity.
+
+### State persistence boundary
+
+State persistence is abstracted behind `StateBackend`.
 
 ```text
-lib_slot          = 1318294
-pending_txs_count = 0
+StateBackend
+│
+├── save(StateSnapshot)
+└── load() -> StateSnapshot
 ```
 
-The local sequencer state successfully caught up with Logos and removed the already-finalized transaction from its pending set. That process is what we refer to here as **checkpoint reconciliation**.
-
-### Why the LIB slot later became 1318294
-
-The Solizone transaction finalized in the block at slot `1318018`. Later the Logos LIB advanced to `1318294`. This does not change the finality of the earlier transaction:
+The current concrete backend is:
 
 ```text
-1318018 finalized
+FileStateBackend
+```
+
+This keeps state serialization separate from the storage provider and gives future persistence experiments a clean integration boundary.
+
+### Snapshot commitment vs protocol state root
+
+There are two different hashes in the current implementation.
+
+#### Protocol state root
+
+```text
+execution::state_root::compute_state_root(...)
+```
+
+This is the execution commitment used in canonical Solizone block headers.
+
+It commits to deterministic account state including:
+
+- account address
+- balance
+- nonce
+- code hash
+- storage
+
+#### Snapshot commitment
+
+```text
+state::commitment::snapshot_commitment(...)
+```
+
+This hashes the deterministic persisted snapshot representation.
+
+It is useful as a persistence fingerprint, but it does **not** replace the protocol state root.
+
+```text
+protocol state root      → block/execution commitment
+snapshot commitment      → persistence snapshot fingerprint
+```
+
+### `SolizoneCheckpoint`
+
+A state snapshot alone can reconstruct EVM state, but a running chain also needs to know where block production should resume.
+
+`SolizoneCheckpoint` therefore stores:
+
+```text
+state
+next_height
+parent_hash
+```
+
+Conceptually:
+
+```text
+SolizoneCheckpoint
+├── StateSnapshot
+├── next_height = N + 1
+└── parent_hash = hash(block N)
+```
+
+`FileCheckpointBackend` persists and reloads that checkpoint from disk.
+
+### Full execution restart
+
+```text
+PROCESS A
+
+MemoryState
+    ↓
+execute blocks #0 and #1
+    ↓
+state after block #1
+    ↓
+SolizoneCheckpoint
+    ├── state snapshot
+    ├── next_height = 2
+    └── parent_hash = hash(block #1)
+    ↓
+file
+
+──────────── process stops ────────────
+
+PROCESS B
+
+checkpoint file
+    ↓
+restore MemoryState
+    ↓
+BlockProducer::resume(
+    next_height = 2,
+    parent_hash = hash(block #1)
+)
+    ↓
+execute next tx
+    ↓
+produce block #2
+```
+
+---
+
+## Block production and canonical history
+
+### `BlockProducer`
+
+`BlockProducer` tracks the chain-head metadata needed for sequential block production:
+
+```text
+version
+chain_id
+gas_limit
+next_height
+parent_hash
+```
+
+For each block:
+
+```text
+transactions
+     ↓
+REVM execute_block(...)
+     ↓
+receipts + final state_root
+     ↓
+build_block(...)
+     ↓
+SolizoneBlock at next_height
+     ↓
+parent_hash = block.hash()
+next_height += 1
+```
+
+This produces automatic chain linkage:
+
+```text
+Block #0
+parent = 0x00...00
+hash = H0
+     ↓
+Block #1
+parent = H0
+hash = H1
+     ↓
+Block #2
+parent = H1
+hash = H2
+```
+
+`BlockProducer::resume(...)` recreates the producer after restart using persisted `next_height` and `parent_hash`.
+
+### `BlockStore`
+
+Canonical block history is storage-agnostic behind:
+
+```text
+BlockStore
+├── insert(block)
+├── get_by_height(height)
+├── get_by_hash(hash)
+├── len()
+└── is_empty()
+```
+
+Current backends:
+
+```text
+BlockStore
+├── MemoryBlockStore
+└── FileBlockStore
+```
+
+### `MemoryBlockStore`
+
+The in-memory implementation maintains:
+
+```text
+height → block
+hash   → height
+```
+
+It supports canonical replacement: replacing a block at a height removes the old hash index.
+
+### `FileBlockStore`
+
+The file implementation stores the canonical encoded bytes for each height:
+
+```text
+block-history/
+├── 0.szb
+├── 1.szb
+└── 2.szb
+```
+
+`<height>.szb` contains `SolizoneBlock::encode()` bytes.
+
+Height lookup is direct:
+
+```text
+height 7
+   ↓
+7.szb
+   ↓
+decode
+   ↓
+SolizoneBlock
+```
+
+Hash lookup currently scans `.szb` files, decodes them, computes block hashes, and returns the match. This is deliberately simple and correctness-first; a persistent hash index has not been implemented yet.
+
+Writing a different block at an existing height overwrites the canonical height file. The old hash is therefore no longer returned as canonical.
+
+### Full durable node recovery test
+
+The current integration test combines both persistence paths:
+
+```text
+PROCESS A
+
+transaction nonce 0
       ↓
-Logos continued producing/finalizing blocks
+Block #0
       ↓
-LIB moved forward
+0.szb
+
+transaction nonce 1
       ↓
-1318018 remains finalized history
+Block #1
+      ↓
+1.szb
+
+MemoryState + chain head
+      ↓
+SolizoneCheckpoint
+      ↓
+checkpoint.json
+
+DROP ALL IN-MEMORY OBJECTS
+
+──────────── complete restart ────────────
+
+PROCESS B
+
+checkpoint.json
+      ↓
+restore MemoryState
+restore BlockProducer at height 2
+
+0.szb + 1.szb
+      ↓
+new FileBlockStore
+      ↓
+recover canonical blocks #0 / #1
+
+transaction nonce 2
+      ↓
+Block #2
+parent = hash(Block #1)
+      ↓
+2.szb
+```
+
+The test verifies:
+
+```text
+sender nonce       = 3
+recipient balance  = 600
+canonical history  = 3 blocks
 ```
 
 ---
@@ -370,13 +644,19 @@ LIB moved forward
 
 The block implementation lives in `src/block.rs`.
 
-The canonical block begins with the magic `SZB1`, followed by:
+The canonical block begins with:
+
+```text
+SZB1
+```
+
+followed by:
 
 - a 170-byte fixed-width header
 - transaction count
 - length-prefixed canonical transactions
 
-### Block header fields
+### Header fields
 
 ```text
 version
@@ -399,33 +679,28 @@ Fixed header size: **170 bytes**.
 Keccak256(canonical block header bytes)
 ```
 
-The block body is committed through `transactions_root`, while execution results are committed through `state_root` and `receipts_root`.
+The body is committed through `transactions_root`, while execution results are committed through `state_root` and `receipts_root`.
 
-### Block validation
+### Current validation
 
-The current `decode_and_validate()` flow checks:
+Current block validation checks canonical structure and the transactions commitment.
 
-- canonical encoding
-- transaction decoding
-- trailing bytes
-- transactions root
+It does **not** yet independently re-execute all transactions during import to verify `state_root` and `receipts_root`.
 
-It does **not** yet independently re-execute transactions, so it does not yet fully prove `state_root` and `receipts_root` during import.
-
-Full block validation will eventually become:
+The future import-validation path is:
 
 ```text
 decode block
       ↓
 validate canonical structure
       ↓
-validate tx commitment
+validate transactions_root
       ↓
 re-execute transactions
       ↓
-recompute state root
+recompute state_root
       ↓
-recompute receipt root
+recompute receipts_root
       ↓
 compare header commitments
 ```
@@ -445,31 +720,30 @@ data
 gas_limit
 ```
 
-Transaction kind is currently `Create` or `Call(address)`.
+Transaction kind is currently:
 
-Canonical transaction encoding begins with `SZT1`, and the transaction hash is:
+```text
+Create
+Call(address)
+```
+
+Canonical transaction encoding begins with:
+
+```text
+SZT1
+```
+
+Transaction hash:
 
 ```text
 Keccak256(canonical transaction bytes)
 ```
 
-### Example transactions
-
-The proven block contains two Solizone transactions.
-
-```text
-contract deployment
-0x0d050d4bb4e349c3091f32034787da0def0858b1fc47fa55ee94548a411bbae5
-
-Counter increment() call
-0x5a46aeb245b5957b4d817b248c8b99c04043ead20d5e6064a8c6f1804a607a2c
-```
-
 ### Important limitation
 
-These are **not** yet raw Ethereum signed transactions. Solizone currently creates execution transactions internally, and the REVM sender is provided by Solizone execution code.
+These are **not yet raw signed Ethereum transactions**.
 
-Missing Ethereum transaction-layer work:
+Missing Ethereum transaction-layer work includes:
 
 - EIP-2718 typed transaction support
 - RLP decoding
@@ -477,8 +751,7 @@ Missing Ethereum transaction-layer work:
 - chain-id validation
 - secp256k1 signature recovery
 - sender derivation
-- gas-price / fee fields
-- EIP-1559 fields
+- EIP-1559 fee fields
 - access lists
 - nonce admission
 - balance admission
@@ -490,7 +763,13 @@ Missing Ethereum transaction-layer work:
 
 Receipt implementation lives in `src/execution/receipt.rs`.
 
-Statuses: `Success`, `Revert`, `Halt`.
+Current statuses:
+
+```text
+Success
+Revert
+Halt
+```
 
 A receipt contains:
 
@@ -502,19 +781,23 @@ contract_address
 logs
 ```
 
-Receipt encoding begins with `SZR1`, and receipt hashes are committed into `receipts_root`.
+Canonical receipt encoding begins with:
 
-### Receipt root
+```text
+SZR1
+```
 
-Receipt commitment logic lives in `src/execution/receipts_root.rs`. The current root uses deterministic Solizone-specific hashing domains. This is a prototype commitment model and is **not** intended to claim Ethereum receipt-trie compatibility.
+Receipt hashes are committed through `receipts_root`.
+
+The current receipt commitment is Solizone-specific and does **not** claim Ethereum receipt-trie compatibility.
 
 ---
 
-## State root
+## State commitments
 
-State commitment logic lives in `src/execution/state_root.rs`.
+The current protocol state root is a deterministic flat Solizone commitment over REVM state.
 
-The current state root is a deterministic flat Solizone commitment over REVM state, committing:
+It commits to:
 
 - accounts
 - balances
@@ -522,13 +805,279 @@ The current state root is a deterministic flat Solizone commitment over REVM sta
 - code hashes
 - storage
 
-It is **not** an Ethereum Merkle Patricia Trie root. That is intentional at this stage — the current priority is determinism, reproducibility, and auditability before introducing more complex proof structures.
+It is **not** an Ethereum Merkle Patricia Trie root.
+
+That is intentional at this stage: the current priority is deterministic, reproducible execution and recovery before introducing Ethereum-compatible trie/proof structures.
+
+---
+
+## Logos blockchain publication
+
+The existing publication path remains an important part of Solizone.
+
+```text
+canonical Solizone block
+        ↓
+SZB1 bytes
+        ↓
+PublicationPayload
+        ↓
+BlockPublisher
+        ↓
+LogosPublisher
+        ↓
+ZoneSequencer
+        ↓
+Mantle inscription
+        ↓
+Logos block
+        ↓
+LIB / finality
+```
+
+### Proven execution-backed publication
+
+A previously reproduced execution-backed canonical Solizone block had:
+
+| Field | Value |
+| --- | --- |
+| Solizone block height | `0` |
+| Transactions | `2` |
+| Gas used | `223126` |
+| Payload size | `975` bytes |
+
+Solizone block hash:
+
+```text
+0xaafe6fe8137374388925d6fc2038da9f36b88cb7ae31c51f7f92ae3e6247e540
+```
+
+Execution commitments:
+
+```text
+state_root
+0xc98e732117ebb7054dc0ac4b79ae64095bc8b79c1bdffc2fb6e2453e0ee142b7
+
+transactions_root
+0x9edd2a6e48d3c88679a390e39dafd06aab7fb437aad4b1c657e725cc0740e77d
+
+receipts_root
+0x5f8eefd86c5f2218ae4282cc6a9b434bd7aec83a7fd7c6b374a2a68870871d9
+```
+
+Logos Mantle transaction carrying the block:
+
+```text
+d8c72874c1df3d3a5533f32c9e404874c9541131ae9b84b588df2b2739abda5b
+```
+
+Included in Logos block:
+
+```text
+block id
+d05e25841617681c23c2114950de5ad4ef7d3ca5864a79f32f43ce175ab3cb49
+
+slot
+1318018
+```
+
+That block later became part of irreversible Logos history.
+
+### Proof that the canonical Solizone bytes were published
+
+The Logos inscription begins with:
+
+```text
+53 5a 42 31
+```
+
+which is ASCII:
+
+```text
+SZB1
+```
+
+The inscription also contained the same locally produced execution commitments, demonstrating that the published payload was the execution-backed canonical Solizone block rather than an unrelated test message.
+
+### Logos terminology
+
+#### Slot
+
+A Logos slot is a consensus-time position or opportunity in which a block may be produced.
+
+#### Block height
+
+Block height counts blocks that were actually produced.
+
+```text
+slot         = consensus-time position
+block height = produced-block sequence
+```
+
+They are not the same concept.
+
+#### LIB
+
+LIB means **Last Irreversible Block** — the latest Logos block considered irreversible/finalized by the protocol.
+
+---
+
+## Logos publication checkpoint
+
+The execution checkpoint introduced in the second phase and the Logos publication checkpoint solve **different problems**.
+
+### Solizone execution checkpoint
+
+```text
+SolizoneCheckpoint
+├── state snapshot
+├── next_height
+└── parent_hash
+```
+
+Purpose:
+
+```text
+restore EVM state
++
+restore local Solizone chain head
+```
+
+### Logos `ZoneSequencer` checkpoint
+
+The publication harness uses:
+
+```text
+.state/sequencer-checkpoint.json
+```
+
+It tracks publication continuity such as:
+
+```text
+last_msg_id
+pending_txs
+lib
+lib_slot
+```
+
+Purpose:
+
+```text
+restore Logos publication progress
++
+reconcile pending local publication state
+with canonical Logos history
+```
+
+On restart:
+
+```text
+load sequencer checkpoint
+      ↓
+connect to Logos
+      ↓
+backfill Logos history
+      ↓
+compare local pending state
+with canonical Logos history
+      ↓
+update checkpoint
+```
+
+For the proven execution-backed publication, a pending transaction was eventually reconciled and removed after finality.
+
+These two recovery domains should remain conceptually separate:
+
+```text
+execution checkpoint
+    → Solizone execution + chain recovery
+
+sequencer checkpoint
+    → Logos publication recovery
+```
+
+A production node will eventually orchestrate both lifecycles.
+
+---
+
+## Logos Storage direction
+
+**Logos Storage is not integrated into `solizone-evm` yet.**
+
+The second-phase work intentionally creates persistence boundaries first so Logos Storage can be evaluated as a backend instead of being coupled directly into REVM.
+
+Current reference implementations:
+
+```text
+execution persistence
+        │
+        ├── StateBackend
+        │     └── FileStateBackend
+        │
+        └── FileCheckpointBackend
+
+canonical block history
+        │
+        └── BlockStore
+              ├── MemoryBlockStore
+              └── FileBlockStore
+```
+
+The next storage experiment is:
+
+> **Can Logos Storage replace or augment Solizone's local persistence backends while preserving deterministic EVM-state recovery and canonical block-history recovery across restart?**
+
+Possible future adapters:
+
+```text
+checkpoint / snapshot persistence
+        ├── local file backend
+        └── Logos Storage backend
+
+canonical block history
+        ├── FileBlockStore
+        └── Logos Storage block-history backend
+```
+
+The intended design rule is:
+
+```text
+REVM
+ ↓
+MemoryState
+ ↓
+persistence interface
+ ↓
+provider
+ ├── local files
+ └── Logos Storage
+```
+
+not:
+
+```text
+REVM → Logos Storage directly
+```
+
+### Logos Storage vs Logos blockchain
+
+These are separate responsibilities:
+
+```text
+Logos Storage
+    → durable storage / retrieval experiment
+
+Logos blockchain / Mantle
+    → publication / shared ordering / consensus / finality
+```
+
+The existing Logos blockchain publication path remains relevant even if Logos Storage becomes a persistence provider.
 
 ---
 
 ## Solidity contract
 
-The current execution milestone uses:
+The current execution tests use a simple Counter contract:
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -550,45 +1099,9 @@ contract Counter {
 }
 ```
 
-The contract is built through Forge using Solc 0.8.20 — described as *Forge-built Solidity bytecode, compiled by Solc 0.8.20*.
+The contract is built through Forge using Solc 0.8.20.
 
-### Counter execution
-
-```text
-deployer funded
-      ↓
-Counter creation bytecode loaded
-      ↓
-REVM CREATE transaction
-      ↓
-contract deployed
-      ↓
-increment() calldata submitted
-      ↓
-REVM CALL
-      ↓
-count changes from 0 → 1
-      ↓
-event emitted
-      ↓
-result committed
-```
-
-Current deployed test contract:
-
-```text
-0x8F7a45eBDe059392E46A46DCc14AB24681A961Ea
-```
-
-Current known gas usage:
-
-| Operation | Gas |
-| --- | --- |
-| deploy | 178299 |
-| increment | 44827 |
-| read | 23466 |
-| revert | 21492 |
-| halt | 25100 |
+The test suite proves deployment, mutation, read-only access, revert behavior, persistence, restart recovery, and continued execution against reconstructed state.
 
 ---
 
@@ -602,7 +1115,6 @@ solizone-evm/
 ├── foundry.toml
 │
 ├── contracts/
-│
 ├── contracts-out/
 │
 └── src/
@@ -611,12 +1123,28 @@ solizone-evm/
     │
     ├── block.rs
     ├── block_builder.rs
+    ├── block_producer.rs
+    ├── block_store.rs
+    ├── memory_block_store.rs
+    ├── file_block_store.rs
     │
     ├── publisher.rs
     ├── logos_publisher.rs
     │
     ├── bin/
-    │   └── publish.rs
+    │   ├── publish.rs
+    │   ├── state_writer.rs
+    │   └── state_reader.rs
+    │
+    ├── state/
+    │   ├── mod.rs
+    │   ├── memory.rs
+    │   ├── snapshot.rs
+    │   ├── commitment.rs
+    │   ├── backend.rs
+    │   ├── file_backend.rs
+    │   ├── checkpoint.rs
+    │   └── file_checkpoint_backend.rs
     │
     └── execution/
         ├── mod.rs
@@ -634,66 +1162,31 @@ solizone-evm/
 
 | Module | Responsibility |
 | --- | --- |
-| `src/main.rs` | Small local REVM execution example; currently demonstrates a generic EVM value transfer. |
-| `src/execution/revm_engine.rs` | Main REVM integration: EOA value transfer, contract creation, contract calls, Solidity Counter execution, storage mutation, revert behavior, halt behavior, receipt generation, state inspection. |
-| `src/execution/transaction.rs` | Defines the current canonical Solizone transaction model. |
-| `src/execution/transactions_root.rs` | Computes deterministic transaction commitments. |
-| `src/execution/receipt.rs` | Defines execution receipts and canonical receipt encoding. |
-| `src/execution/receipts_root.rs` | Computes the receipt commitment. |
-| `src/execution/state_root.rs` | Computes the current deterministic prototype state commitment. |
-| `src/block.rs` | Defines `SolizoneBlock`, `SolizoneBlockHeader`, canonical encoding/decoding, block hash, transaction-root validation. |
-| `src/block_builder.rs` | Builds a canonical block from transactions, receipts, execution state, and gas information. |
-| `src/publisher.rs` | Defines the generic publication boundary: `SolizoneBlock → PublicationPayload → BlockPublisher`. |
-| `src/logos_publisher.rs` | Logos-specific publisher adapter; keeps Logos-specific behavior outside the EVM execution engine. |
-| `src/bin/publish.rs` | End-to-end publication harness (see below). |
-
-The publication harness flow:
-
-```text
-executes Counter
-      ↓
-builds transactions
-      ↓
-builds receipts
-      ↓
-computes roots
-      ↓
-builds Solizone block
-      ↓
-serializes SZB1 bytes
-      ↓
-connects to Logos
-      ↓
-publishes inscription
-      ↓
-persists checkpoint
-      ↓
-drives ZoneSequencer
-```
-
----
-
-## Dependencies
-
-```toml
-revm = "43.0.2"
-hex = "0.4.3"
-serde_json = "1"
-
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-```
-
-The Logos integration currently uses local path dependencies:
-
-```text
-../../logos-blockchain-basecamp-compat/zone-sdk
-../../logos-blockchain-basecamp-compat/services/key-management-system
-../../logos-blockchain-basecamp-compat/zk/groth16
-```
-
-This compatibility checkout exists because the currently installed Basecamp node API differs from newer Logos source revisions. It is development infrastructure, not a final Solizone distribution strategy.
+| `src/main.rs` | Small local REVM execution example. |
+| `src/execution/revm_engine.rs` | Main REVM integration: transaction execution, contract deployment/calls, block execution, receipts, read-only execution, state updates. |
+| `src/execution/transaction.rs` | Current canonical Solizone transaction model and encoding. |
+| `src/execution/transactions_root.rs` | Deterministic transaction commitment. |
+| `src/execution/receipt.rs` | Execution receipt model and canonical encoding. |
+| `src/execution/receipts_root.rs` | Receipt commitment. |
+| `src/execution/state_root.rs` | Protocol state root committed into Solizone block headers. |
+| `src/state/memory.rs` | Active REVM state owner, snapshot creation/restore, state-root access. |
+| `src/state/snapshot.rs` | Persistence-friendly account / bytecode / storage snapshot model. |
+| `src/state/commitment.rs` | Deterministic snapshot commitment. |
+| `src/state/backend.rs` | Generic state snapshot persistence boundary. |
+| `src/state/file_backend.rs` | File-backed `StateBackend`. |
+| `src/state/checkpoint.rs` | `SolizoneCheckpoint`: state + next height + parent hash. |
+| `src/state/file_checkpoint_backend.rs` | File-backed execution checkpoint persistence. |
+| `src/block.rs` | Canonical Solizone block/header, encoding/decoding, hash, tx-root validation. |
+| `src/block_builder.rs` | Builds canonical blocks from transactions, receipts, state root, and gas data. |
+| `src/block_producer.rs` | Executes batches, produces parent-linked blocks, tracks/resumes chain head. |
+| `src/block_store.rs` | Storage-neutral canonical block-history interface. |
+| `src/memory_block_store.rs` | In-memory canonical block history with height/hash lookup. |
+| `src/file_block_store.rs` | File-backed `.szb` block history with restart recovery. |
+| `src/publisher.rs` | Generic publication boundary: `SolizoneBlock → PublicationPayload → BlockPublisher`. |
+| `src/logos_publisher.rs` | Logos-specific publisher adapter. |
+| `src/bin/publish.rs` | End-to-end Logos publication harness. |
+| `src/bin/state_writer.rs` | Process-A persistence experiment. |
+| `src/bin/state_reader.rs` | Process-B state recovery + continued execution experiment. |
 
 ---
 
@@ -702,40 +1195,59 @@ This compatibility checkout exists because the currently installed Basecamp node
 ```bash
 cd solizone-evm
 
-cargo build        # build
-cargo check        # quick compile check
-cargo run          # run the simple generic transfer example in src/main.rs
-```
-
-### Tests
-
-```bash
+cargo build
+cargo check
+cargo run
 cargo test
-
-# Solidity Counter execution test
-cargo test executes_solidity_counter -- --nocapture
 ```
 
-Current execution coverage includes:
+### Current test coverage
+
+The current suite covers:
 
 - value transfer
-- contract deployment
-- contract call
-- storage mutation
-- receipt construction
-- receipt hashing
-- receipt roots
-- state commitment
-- transaction encoding
-- transaction roots
-- canonical block encoding
-- canonical block validation
+- shared state across multiple transfers
+- Solidity deployment
+- generic contract calls
+- read-only contract calls
+- contract storage mutation
+- success/revert/halt receipts
+- transaction and receipt commitments
+- protocol state-root changes
+- deterministic snapshots
+- snapshot JSON round trip
+- file-backed state persistence
+- snapshot commitments
+- state-root continuity after restore
+- contract bytecode/storage continuity after restore
+- ordered block execution
+- canonical block construction
+- parent-linked block progression
+- block-producer resume
+- EVM-state + producer restart
+- file-backed execution checkpoints
+- in-memory block history
+- file-backed block history
+- block lookup by height
+- block lookup by hash
+- canonical block replacement
+- full durable restart with state + producer + canonical history
+
+Latest result:
+
+```text
+29 passed; 0 failed
+```
 
 ---
 
-## Block publisher CLI
+## Publisher CLI
 
-The current publisher harness is `src/bin/publish.rs`. It supports several modes.
+The current publisher harness is:
+
+```text
+src/bin/publish.rs
+```
 
 ### Dry run
 
@@ -743,7 +1255,7 @@ The current publisher harness is `src/bin/publish.rs`. It supports several modes
 cargo run --bin publish
 ```
 
-Executes the Counter flow, builds the canonical Solizone block, and prints block data — without connecting to Logos.
+Builds the execution-backed canonical Solizone block without publishing it.
 
 ### Connect only
 
@@ -751,21 +1263,7 @@ Executes the Counter flow, builds the canonical Solizone block, and prints block
 cargo run --bin publish -- --connect
 ```
 
-```text
-loads checkpoint
-      ↓
-connects to Basecamp Logos node
-      ↓
-backfills
-      ↓
-waits until ZoneSequencer Ready
-      ↓
-receives live checkpoint
-      ↓
-exits
-```
-
-No new block is published.
+Loads the publication checkpoint, connects to the Logos node, backfills history, and waits for the sequencer to become ready.
 
 ### Send
 
@@ -773,270 +1271,196 @@ No new block is published.
 cargo run --bin publish -- --send
 ```
 
-The send lifecycle:
+Publication lifecycle:
 
 ```text
 build Solizone block
       ↓
 convert bytes → Logos Inscription
       ↓
-ZoneSequencer handle().publish()
+ZoneSequencer publish()
       ↓
-transaction accepted locally
+accepted locally
       ↓
-save checkpoint immediately
+save checkpoint
       ↓
 continue driving next_event()
       ↓
-network POST progresses
+pending mempool
       ↓
-MempoolPending
+on-chain
+      ↓
+finalized
 ```
 
-> **Important:** `publish()` returning does not by itself mean the Logos node has accepted the transaction. The `ZoneSequencer` drive loop must continue being polled.
+> `publish()` returning does not itself prove Logos node acceptance. The sequencer must continue being driven until network state advances.
 
 ### Resume
 
 ```bash
 RUST_LOG=warn cargo run --bin publish -- --resume
-
-# deeper SDK logging
-RUST_LOG=debug cargo run --bin publish -- --resume
 ```
 
-`--resume` does not create another inscription. It restores the existing checkpoint and continues driving the sequencer. Useful after process restart, network interruption, local application exit, or pending transaction recovery.
-
-### Publication safety
-
-Before creating a new publication, the harness checks whether the checkpoint already contains pending transactions:
-
-```text
-pending tx exists
-        ↓
-refuse --send
-        ↓
-use --resume
-```
-
-This prevents accidental duplicate publication while an older transaction is unresolved.
-
-### Publisher checkpoint
-
-```text
-.state/sequencer-checkpoint.json
-```
-
-The publisher can also use the older Experiment 003 checkpoint as an initial migration source if a local checkpoint does not exist. The checkpoint stores publication continuity information such as `last_msg_id`, `pending_txs`, `lib`, `lib_slot`.
-
-### Logos channel and node
-
-The current prototype publishes through the same research channel established during the earlier experiments. The publisher expects the channel credentials under:
-
-```text
-../experiments/experiment-003-canonical-block/.secrets/
-```
-
-> 🔐 **The sequencer private key must never be committed.**
-
-The local Basecamp node is currently expected at:
-
-```text
-http://127.0.0.1:8080
-```
-
----
-
-## Publication lifecycle
-
-```text
-Solizone block built
-        ↓
-Logos transaction created
-        ↓
-AcceptedLocally
-        ↓
-PendingMempool
-        ↓
-OnChain
-        ↓
-Finalized
-```
-
-These are not the same state.
-
-| Stage | Meaning |
-| --- | --- |
-| **Accepted locally** | The Zone SDK has created, funded, signed and tracked the transaction. This does not yet prove node acceptance. |
-| **Pending mempool** | The transaction has been successfully posted to the Logos node. |
-| **On-chain** | The transaction appears in a canonical Logos block. |
-| **Finalized** | The containing Logos block reaches irreversible Logos history. |
-
-For the execution-backed Solizone block, the final state has been proven.
-
-### Current finalized checkpoint state
-
-After restarting and allowing the `ZoneSequencer` to reconcile with Logos history, checkpoint pending transactions and `pending_publish_txs` were both `0`, and the saved checkpoint contained:
-
-```json
-{
-  "lib_slot": 1318294,
-  "pending_txs_count": 0,
-  "pending_tx_hashes": []
-}
-```
-
-This is the expected post-finalization state.
-
----
-
-## Relationship to earlier experiments
-
-The earlier experiments remain important research evidence.
-
-### Experiment 001
-
-Validated Logos Zone SDK connectivity, channel behavior, sequencer identity, checkpoint behavior, opaque publication, ordering continuity.
-
-### Experiment 002
-
-Validated publication-size behavior and explored inscription constraints. The important protocol-side bound discovered from Logos source was:
-
-```text
-MAX_BLOCK_TRANSACTIONS_SIZE = 2,097,152 bytes
-
-MAX_BYTES = MAX_BLOCK_TRANSACTIONS_SIZE * 7 / 8
-          = 1,835,008 bytes
-```
-
-for the inscription upper bound in that implementation. The successful tests did **not** establish 1 MiB as a protocol maximum.
-
-### Experiment 003
-
-Validated the canonical Solizone block format, block publication, Logos inclusion, and finality. The original Experiment 003 block still used synthetic transaction data, a placeholder state root, and a placeholder receipt root.
-
-### Difference between Experiment 003 and current solizone-evm
-
-```text
-before:
-synthetic txs
-placeholder state
-placeholder receipts
-
-now:
-REVM execution
-      ↓
-real Solizone txs
-      ↓
-real execution receipts
-      ↓
-execution-derived state commitment
-      ↓
-execution-backed canonical block
-```
-
-This is the important bridge between the research experiments and the active execution implementation.
+`--resume` restores the existing publication checkpoint and continues the outstanding publication lifecycle instead of creating a duplicate inscription.
 
 ---
 
 ## Current limitations
 
-**EVM state is still temporary.** Current REVM state exists in memory. Restarting the process does not restore the Solizone EVM state. Persistent state is one of the next major milestones.
+### No Ethereum wallet transaction layer yet
 
-**The published block is currently a demonstration block.** It uses `height = 0` and a zero `parent_hash`. A real chain needs:
+Solizone does not yet accept raw signed Ethereum transactions from MetaMask, Foundry `cast send`, ethers, or viem.
+
+### No Ethereum JSON-RPC yet
+
+There is no current `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getBalance`, or similar public RPC surface.
+
+### No transaction pool yet
+
+Transactions are currently supplied directly to execution/block-production code.
+
+### State root is Solizone-specific
+
+The protocol state root is deterministic and execution-derived but is not an Ethereum Merkle Patricia Trie root.
+
+### Receipts are Solizone-specific
+
+Current receipts are canonical Solizone receipts, not Ethereum JSON-RPC receipt objects.
+
+### Block import validation is incomplete
+
+Current validation does not yet independently re-execute imported blocks to verify both state and receipt roots.
+
+### Local persistence is prototype persistence
+
+`FileStateBackend`, `FileCheckpointBackend`, and `FileBlockStore` use straightforward file I/O.
+
+They do not yet provide a transactional database or atomic crash-consistent commit spanning:
 
 ```text
-Block N
-      ↓
-hash
-      ↓
-Block N+1.parent_hash
+state checkpoint + canonical block history
 ```
 
-**Transactions are not Ethereum-wallet transactions.** There is not yet support for MetaMask, Foundry `cast send`, or `eth_sendRawTransaction` against Solizone.
+### File block hash lookup is linear
 
-**State root is prototype-specific.** It provides deterministic commitment but not Ethereum state-trie compatibility.
+`FileBlockStore::get_by_hash()` scans `.szb` files. There is no persistent hash index yet.
 
-**Receipts are Solizone-specific.** They use Solizone's canonical encoding and are not yet Ethereum JSON-RPC receipt objects.
+### Logos Storage is not integrated yet
 
-**Logos publication is still an R&D harness.** `src/bin/publish.rs` is not yet a daemon or production block-publishing service.
+Logos Storage remains the next backend experiment. The current durable path uses local files.
+
+### Logos publication is still an R&D harness
+
+`src/bin/publish.rs` is not yet a continuously running production block publisher.
+
+### Execution and publication recovery are separate
+
+The local execution checkpoint and Logos sequencer checkpoint are intentionally distinct today. A production Solizone node still needs orchestration around both recovery domains.
 
 ---
 
-## Development principle
+## Development principles
 
-Keep the following boundaries separate, even if one process currently performs all of them:
-
-- Execution engine
-- Block producer
-- Publisher
-- Logos integration
-
-Long-term:
+Keep these boundaries separate even if one process eventually orchestrates all of them:
 
 ```text
-BlockProducer
+Execution engine
       ↓
-produces SolizoneBlock
-
-BlockPublisher
+State / persistence boundary
       ↓
-publishes SolizoneBlock
+Block producer
+      ↓
+Canonical block store
+      ↓
+Publisher
+      ↓
+Logos blockchain integration
 ```
 
-The block producer should not care whether publication eventually uses Logos, a mock publisher, test storage, or another DA layer.
+Important rules:
+
+> **REVM should not know how Logos blockchain publication works.**
+
+> **REVM should not depend directly on a particular storage provider.**
+
+> **The block producer should produce canonical Solizone blocks regardless of how they are later published.**
+
+> **A Logos Storage integration should sit behind a persistence abstraction rather than inside execution semantics.**
+
+> **Logos blockchain publication and Logos Storage persistence are separate responsibilities.**
 
 ---
 
 ## Roadmap
 
+### Completed second-phase foundation
+
+```text
+persistent EVM state                         ✅
+deterministic snapshot / restore             ✅
+file-backed state persistence                ✅
+combined state + chain-head checkpoint       ✅
+parent-linked multi-block production         ✅
+BlockProducer abstraction                    ✅
+producer restart / resume                    ✅
+persistent canonical block history           ✅
+height / hash block retrieval                ✅
+full state + producer + history restart      ✅
+```
+
 ### Immediate next steps
 
-1. Persist Solizone EVM state across restarts
-2. Add persistent Solizone chain storage
-3. Add parent-linked multi-block production
-4. Introduce a real `BlockProducer` abstraction
-5. Introduce a transaction pool
-6. Accept raw signed Ethereum transactions
-7. Implement secp256k1 signature recovery
-8. Add nonce and balance admission rules
-9. Add Ethereum fee handling
-10. Add Ethereum JSON-RPC
-11. Re-execute imported blocks
-12. Verify `state_root` during import
-13. Verify `receipts_root` during import
-14. Turn Logos publication into a durable publisher service
-15. Add restart / reorg / multi-block integration tests
+1. Prototype a **Logos Storage persistence backend** against the current persistence abstractions.
+2. Determine whether Logos Storage is best used for state checkpoints, canonical block history, archival data, or a combination.
+3. Introduce a long-running Solizone node lifecycle around the existing state, producer, checkpoint, and block-store components.
+4. Add a transaction pool.
+5. Accept raw signed Ethereum transactions.
+6. Implement EIP-2718/RLP transaction decoding and secp256k1 sender recovery.
+7. Add chain-id, nonce, balance, and fee admission rules.
+8. Add a minimal Ethereum-compatible JSON-RPC surface.
+9. Add imported-block re-execution and verify `state_root` / `receipts_root`.
+10. Improve persistence crash consistency / atomicity.
+11. Turn Logos publication into a durable service coordinated with local chain recovery.
 
-### Next major target
+### Next storage experiment
 
-Move from a single deterministic demo block to a persistent Solizone chain:
+Reference baseline:
 
 ```text
-Block 0
-  hash H0
-      ↓
-Block 1
-  parent_hash = H0
-  hash H1
-      ↓
-Block 2
-  parent_hash = H1
-  hash H2
+Solizone execution state
+        ↓
+SolizoneCheckpoint
+        ↓
+FileCheckpointBackend
+
+canonical Solizone blocks
+        ↓
+BlockStore
+        ↓
+FileBlockStore
 ```
 
-with state advancing:
+Experimental extension:
 
 ```text
-State 0
-   ↓ execute txs
-State 1
-   ↓ execute txs
-State 2
+Solizone execution state
+        ↓
+checkpoint / snapshot abstraction
+        ├── local file backend
+        └── Logos Storage backend
+
+canonical Solizone blocks
+        ↓
+BlockStore-style boundary
+        ├── FileBlockStore
+        └── Logos Storage-backed history
 ```
 
-and every resulting canonical block published independently to Logos.
+Experiment question:
 
-### Future Ethereum tooling flow
+> **Can Logos Storage replace or augment local persistence while preserving deterministic state recovery and canonical block-history recovery across restart?**
+
+### Next developer-facing target
 
 ```text
 Foundry / MetaMask / ethers / viem
@@ -1045,104 +1469,75 @@ Ethereum JSON-RPC
         ↓
 eth_sendRawTransaction
         ↓
-Solizone tx decoder
+Ethereum transaction decoding
         ↓
-signature recovery
+signature recovery + admission
         ↓
-mempool
+transaction pool
         ↓
-block producer
+BlockProducer
         ↓
 REVM
         ↓
 persistent Solizone state
         ↓
-canonical Solizone block
+parent-linked canonical block
+        ├────────────→ persistence backend
+        │                local / Logos Storage experiment
         ↓
-Logos publication
+Logos blockchain publication
         ↓
-Logos finality
+Logos ordering / finality
 ```
 
-### Current goal
-
-The current research proof is:
-
-```text
-Solidity
-      ↓
-REVM
-      ↓
-Solizone execution
-      ↓
-canonical Solizone block
-      ↓
-Logos inscription
-      ↓
-Logos finality
-```
-
-The next phase is:
-
-```text
-Ethereum signed transaction
-        ↓
-Solizone admission / mempool
-        ↓
-REVM execution
-        ↓
-persistent state
-        ↓
-parent-linked Solizone blocks
-        ↓
-durable Logos publication
-        ↓
-Logos finality
-```
-
-That moves Solizone from a reproducible execution-and-publication prototype toward an actual EVM-compatible Sovereign Zone runtime.
+This moves Solizone from a restartable execution-and-chain prototype toward a developer-facing EVM-compatible Sovereign Zone runtime.
 
 ---
 
 ## Useful commands
 
 ```bash
-# enter the crate
+# enter crate
 cd solizone-evm
 
-# compile / build
+# compile
 cargo check
 cargo build
 
-# run local EVM example
-cargo run
+# format
+cargo fmt
+cargo fmt -- --check
 
-# tests
+# full tests
 cargo test
+
+# Solidity Counter
 cargo test executes_solidity_counter -- --nocapture
 
-# build canonical publication block locally
+# durable state + producer + canonical-history restart
+cargo test resumes_full_node_from_disk_checkpoint -- --nocapture
+
+# block history persistence
+cargo test persists_and_recovers_block_by_height -- --nocapture
+cargo test persists_and_recovers_block_by_hash -- --nocapture
+
+# local publication dry run
 cargo run --bin publish
 
 # connect without publishing
 cargo run --bin publish -- --connect
 
-# publish a new block
+# publish
 cargo run --bin publish -- --send
 
-# resume existing publication
+# resume publication
 RUST_LOG=warn cargo run --bin publish -- --resume
 
-# debug Logos SDK behavior
+# SDK debugging
 RUST_LOG=debug cargo run --bin publish -- --resume
-
-# formatting and lint
-cargo fmt
-cargo fmt -- --check
-cargo clippy --all-targets
 ```
 
-Inspect the checkpoint:
+Inspect the Logos publication checkpoint:
 
 ```bash
 jq '{
@@ -1160,12 +1555,12 @@ jq '{
 | Document | Path |
 | --- | --- |
 | Repository overview | `../README.md` |
-| Architecture / EVM design | `../SOLIZONE_EVM_README.md` |
 | Development roadmap | `../DEVELOPMENT_ROADMAP.md` |
 | Experiment 001 | `../experiments/minimal-zone/` |
 | Experiment 002 | `../experiments/experiment-002-publication-limits/` |
 | Experiment 003 | `../experiments/experiment-003-canonical-block/` |
+| Logos Storage research | `../research/` / relevant storage experiment documentation |
 
 ---
 
-*Solizone is an independent research prototype and is not an official Logos project.*
+**Solizone is an independent research prototype and is not an official Logos project.**
