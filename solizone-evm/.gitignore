@@ -10,3 +10,6 @@ solizone-config.json
 storage-config.json
 hello-solizone-downloaded.txt
 hello-solizone.txt
+solizone-checkpoint-downloaded.json
+solizone-checkpoint.json
+checkpoint-from-rust.json
