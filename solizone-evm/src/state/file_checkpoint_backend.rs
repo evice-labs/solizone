@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::SolizoneCheckpoint;
+use super::{CheckpointBackend, SolizoneCheckpoint};
 
 pub struct FileCheckpointBackend {
     path: PathBuf,
@@ -25,6 +25,28 @@ impl FileCheckpointBackend {
     }
 
     pub fn load(&self) -> Result<Option<SolizoneCheckpoint>, io::Error> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        let json = std::fs::read_to_string(&self.path)?;
+
+        let checkpoint = SolizoneCheckpoint::decode_json(&json).map_err(io::Error::other)?;
+
+        Ok(Some(checkpoint))
+    }
+}
+
+impl CheckpointBackend for FileCheckpointBackend {
+    type Error = io::Error;
+
+    fn save(&self, checkpoint: &SolizoneCheckpoint) -> Result<(), Self::Error> {
+        let json = checkpoint.encode_json().map_err(io::Error::other)?;
+
+        std::fs::write(&self.path, json)
+    }
+
+    fn load(&self) -> Result<Option<SolizoneCheckpoint>, Self::Error> {
         if !self.path.exists() {
             return Ok(None);
         }

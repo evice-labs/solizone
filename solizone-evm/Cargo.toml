@@ -14,3 +14,4 @@ hex = "0.4.3"
 revm = "43.0.2"
 revm-bytecode = "43.0.0"
 serde = { version = "1", features = ["derive"] }
+# storage-bindings = { git = "https://github.com/logos-storage/storage-rust-bindings", rev = "71aa3fe896c0dae5bd587964e6b4943cdb1245f0" }
