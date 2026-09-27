@@ -4,6 +4,7 @@ pub mod checkpoint_backend;
 pub mod commitment;
 pub mod file_backend;
 pub mod file_checkpoint_backend;
+pub mod logos_storage_checkpoint_backend;
 pub mod memory;
 pub mod snapshot;
 
@@ -12,5 +13,6 @@ pub use checkpoint::SolizoneCheckpoint;
 pub use checkpoint_backend::CheckpointBackend;
 pub use file_backend::FileStateBackend;
 pub use file_checkpoint_backend::FileCheckpointBackend;
+pub use logos_storage_checkpoint_backend::LogosStorageCheckpointBackend;
 pub use memory::MemoryState;
 pub use snapshot::{AccountSnapshot, StateSnapshot, StorageSlotSnapshot};

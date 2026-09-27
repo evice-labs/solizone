@@ -4,6 +4,7 @@ pub mod block_producer;
 pub mod block_store;
 pub mod execution;
 pub mod file_block_store;
+pub mod hybrid_block_store;
 pub mod logos_publisher;
 pub mod logos_storage_client;
 pub mod memory_block_store;

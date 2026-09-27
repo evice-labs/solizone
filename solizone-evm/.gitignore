@@ -13,3 +13,17 @@ hello-solizone.txt
 solizone-checkpoint-downloaded.json
 solizone-checkpoint.json
 checkpoint-from-rust.json
+storage-block-archive-test
+storage-block-archive-work
+storage-block-prune-test
+block-archive-index.json
+hybrid-auto-index.json
+latest-checkpoint.cid
+retention-window-index.json
+retention-window-recovery
+retention-window-blocks
+retention-window-archive-work
+hybrid-trait-recovery
+hybrid-block-recovery
+hybrid-auto-recovery
+hybrid-auto-blocks
