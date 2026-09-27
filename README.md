@@ -2,9 +2,9 @@
 
 **Solizone is an experimental EVM execution environment built as a Sovereign Zone on Logos.**
 
-It lets Solidity/EVM execution remain inside Solizone while using the Logos stack for publication, ordering, data availability, and finality.
+It keeps Solidity / EVM execution inside Solizone while using the Logos stack for publication, ordering, finality, and distributed persistence.
 
-> Solizone is an independent research prototype and is **not an official Logos project**.
+> Solizone is an independent research project and is **not an official Logos project**.
 
 ---
 
@@ -15,18 +15,19 @@ The active implementation lives in [`solizone-evm/`](./solizone-evm).
 Today, Solizone can:
 
 - execute Solidity contracts and generic EVM transactions with REVM
-- maintain account, nonce, balance, bytecode, and contract-storage state
-- produce execution receipts and deterministic state / transaction / receipt commitments
-- build canonical `SZB1` Solizone blocks
-- produce parent-linked multi-block chains
-- persist EVM state checkpoints across restarts
-- persist canonical block history to disk
-- recover state, chain head, and historical blocks after a full process restart
-- continue execution from the recovered state
+- maintain persistent EVM account and contract state
+- produce receipts and deterministic state / transaction / receipt commitments
+- build canonical `SZB1` blocks and parent-linked block chains
+- run as a long-running Solizone node
+- persist execution checkpoints through Logos Storage
+- recover EVM state and chain head after a full process restart
+- continue block production from the recovered height
+- keep recent canonical blocks locally through `HybridBlockStore`
+- automatically archive older blocks into Logos Storage
+- prune archived local blocks while keeping historical data recoverable
+- validate and hash-check blocks recovered from Logos Storage
 - publish canonical Solizone block bytes through the Logos Zone SDK
 - observe published blocks reaching Logos finality
-
-The current test suite passes **29 tests with 0 failures** on the `feat/second-phase` branch.
 
 ---
 
@@ -35,9 +36,9 @@ The current test suite passes **29 tests with 0 failures** on the `feat/second-p
 ```text
 Ethereum tooling
       ↓
-Ethereum JSON-RPC                     (next)
+Ethereum JSON-RPC                     (next phase)
       ↓
-Solizone transaction pool             (next)
+Solizone transaction pool             (next phase)
       ↓
 BlockProducer
       ↓
@@ -47,14 +48,17 @@ Solizone EVM state
       ↓
 canonical Solizone block
       │
-      ├──────── persistence ────────┐
-      │                              │
-      ↓                              ↓
-state checkpoint                block history
-      │                              │
-local file backend             FileBlockStore
-      │                              │
-      └──── future Logos Storage ────┘
+      ├───────────────┐
+      │               │
+      ↓               ↓
+checkpoint      HybridBlockStore
+      │          │           │
+      │          ↓           ↓
+      │      recent blocks   older blocks
+      │        local         Logos Storage
+      │
+      ↓
+Logos Storage
 
 canonical Solizone block
       ↓
@@ -71,24 +75,57 @@ ordering / consensus / finality
 
 **Solizone owns**
 
-- EVM execution
-- accounts and contract state
-- transaction execution
-- receipts and gas accounting
+- EVM execution and state
+- transaction execution and receipts
 - state commitments
 - block production
 - canonical block history
-- local execution recovery
+- checkpointing and recovery
+- local retention and historical block verification
 
-**Logos provides**
+**Logos Storage provides**
+
+- execution-checkpoint persistence
+- historical canonical block storage
+- content-addressed retrieval
+
+**Logos blockchain provides**
 
 - Zone publication
 - shared ordering
-- data availability
 - consensus
 - finality
 
-**Logos Storage** is the next persistence experiment. The goal is to evaluate it as an additional backend for state checkpoints and canonical block history without coupling REVM directly to storage infrastructure.
+Logos Storage does **not** determine canonical history. Recovered blocks are validated and checked against their recorded canonical hashes.
+
+---
+
+## Hybrid Storage Layer
+
+Solizone now uses a hybrid storage model:
+
+```text
+HybridBlockStore
+├── recent blocks → local FileBlockStore
+└── older blocks  → Logos Storage
+                    via height → hash → CID
+```
+
+A configurable retention window keeps local historical storage bounded while older canonical blocks remain retrievable and verifiable.
+
+On restart, Solizone can:
+
+```text
+download latest checkpoint
+        ↓
+restore EVM state
+        ↓
+restore chain head
+        ↓
+verify stored head block
+        ↓
+continue producing blocks
+```
 
 ---
 
@@ -97,31 +134,11 @@ ordering / consensus / finality
 ```text
 solizone/
 ├── solizone-evm/        # active Rust implementation
-├── experiments/         # Logos / Zone SDK research experiments
+├── experiments/         # Logos / Zone SDK research
 ├── research/            # design and protocol research
 ├── dev-roadmap/         # development notes
 ├── DEVELOPMENT_ROADMAP.md
 └── README.md
-```
-
-### `solizone-evm/`
-
-The active implementation includes:
-
-```text
-REVM execution
-      ↓
-persistent EVM state
-      ↓
-BlockProducer
-      ↓
-parent-linked Solizone blocks
-      ↓
-BlockStore / FileBlockStore
-      ↓
-restart + recovery
-      ↓
-Logos publication
 ```
 
 See [`solizone-evm/README.md`](./solizone-evm/README.md) for the detailed implementation status and architecture.
@@ -131,51 +148,44 @@ See [`solizone-evm/README.md`](./solizone-evm/README.md) for the detailed implem
 ## Proven flow
 
 ```text
-Solidity
-   ↓
+Solidity / EVM transaction
+      ↓
 REVM execution
-   ↓
+      ↓
 state transition + receipt
-   ↓
+      ↓
 canonical Solizone block
-   ↓
-persistent state + block history
-   ↓
-Logos inscription
-   ↓
-Logos block inclusion
-   ↓
-finality
+      ↓
+HybridBlockStore
+      ├── recent history → local
+      └── older history → Logos Storage
+      ↓
+execution checkpoint → Logos Storage
 ```
 
-A complete local restart has also been tested:
+The publication path remains separate:
 
 ```text
-produce block #0
+canonical Solizone block
       ↓
-produce block #1
+Logos Zone SDK / Mantle
       ↓
-persist state + block history
+Logos blockchain
       ↓
-process stops
-      ↓
-restore state + chain head + blocks
-      ↓
-produce block #2
+ordering / consensus / finality
 ```
 
 ---
 
 ## Next milestones
 
-1. Prototype **Logos Storage** as a persistence backend.
-2. Add a long-running Solizone node lifecycle.
-3. Add a transaction pool.
-4. Accept raw signed Ethereum transactions.
-5. Implement signature recovery and admission rules.
-6. Add a minimal Ethereum-compatible JSON-RPC surface.
-7. Connect familiar tooling such as Foundry, ethers, viem, and wallets.
-8. Turn Logos publication into a durable node service.
+1. Design raw signed Ethereum transaction ingestion.
+2. Add a Solizone transaction pool.
+3. Implement signature recovery and transaction admission rules.
+4. Add a minimal Ethereum-compatible JSON-RPC surface.
+5. Connect Foundry, ethers, viem, and wallets.
+6. Add independent block re-execution / validation.
+7. Continue hardening the node, storage, and Logos publication paths.
 
 ---
 
@@ -188,10 +198,16 @@ cargo check
 cargo test
 ```
 
-Run the execution example:
+Run the long-running Solizone node:
 
 ```bash
-cargo run
+cargo run --bin solizone_node
+```
+
+Reset the local node runtime state:
+
+```bash
+cargo run --bin solizone_node -- reset
 ```
 
 Run the Logos publication harness:
@@ -200,8 +216,6 @@ Run the Logos publication harness:
 cargo run --bin publish
 ```
 
-See the detailed [`solizone-evm/README.md`](./solizone-evm/README.md) for publication modes, persistence tests, and architecture notes.
-
 ---
 
 ## Project thesis
@@ -209,10 +223,13 @@ See the detailed [`solizone-evm/README.md`](./solizone-evm/README.md) for public
 ```text
 Execution belongs to Solizone.
 
-Canonical execution history belongs to Solizone.
+Recent execution data stays close to the node.
+
+Historical execution data remains accessible
+through Logos Storage.
 
 Logos provides the shared foundation for publishing,
-ordering, and finalizing that history.
+ordering, consensus, and finality.
 ```
 
-The long-term goal is to give Ethereum developers a familiar Solidity/EVM development experience while remaining native to the Logos Zone architecture.
+The long-term goal is to give Ethereum developers a familiar Solidity / EVM development experience while remaining native to the Logos architecture.

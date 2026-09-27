@@ -2,9 +2,9 @@
 
 **A stateful, restartable EVM execution environment for Logos.**
 
-Solizone executes Solidity/EVM transactions with REVM, maintains recoverable state, produces parent-linked canonical blocks, publishes those blocks to Logos for ordering/finality, and is now experimenting with Logos Storage for checkpoint and historical block durability.
+Solizone executes Solidity / EVM transactions with REVM, maintains recoverable state, produces parent-linked canonical blocks, publishes those blocks through the Logos Zone SDK, and now uses Logos Storage for execution checkpoints and historical block persistence.
 
-> **Status:** active research prototype on `feat/second-phase`  
+> **Status:** active research implementation on `feat/second-phase`  
 > **Note:** Solizone is an independent project and is not an official Logos project.
 
 ---
@@ -23,7 +23,7 @@ Logos
 
 Solizone owns EVM execution and state.
 
-Logos provides the shared infrastructure around it:
+The Logos stack provides shared infrastructure around it:
 
 ```text
 Logos blockchain
@@ -33,9 +33,12 @@ Logos blockchain
 → finality
 
 Logos Storage
-→ durable/shared content storage
-→ checkpoint and historical-block experiments
+→ execution checkpoint persistence
+→ historical canonical block storage
+→ content-addressed retrieval
 ```
+
+The long-term goal is to give Ethereum developers a familiar Solidity / EVM environment while remaining native to the Logos architecture.
 
 ---
 
@@ -48,7 +51,7 @@ Logos Storage
 - mutable contract storage and read-only calls
 - persistent balances, nonces, bytecode, and storage
 - ordered transaction-batch execution
-- receipts and deterministic transaction/receipt/state commitments
+- receipts and deterministic transaction / receipt / state commitments
 
 ### State and recovery
 
@@ -57,8 +60,11 @@ Logos Storage
 - JSON and file-backed persistence
 - `SolizoneCheckpoint`
 - checkpoint contains EVM state + `next_height` + `parent_hash`
-- complete process restart and continued execution
+- `FileCheckpointBackend`
+- `LogosStorageCheckpointBackend`
+- full process restart and continued execution
 - protocol state-root continuity after restore
+- remote checkpoint recovery through Logos Storage
 
 ### Canonical chain
 
@@ -69,8 +75,22 @@ Logos Storage
 - `BlockStore`
 - `MemoryBlockStore`
 - `FileBlockStore`
+- `HybridBlockStore`
 - lookup by height or hash
-- durable local canonical history
+- recent canonical history retained locally
+- historical canonical blocks archived into Logos Storage
+- automatic pruning with a configurable retention window
+- recovered historical blocks decoded, validated, and hash-checked
+
+### Long-running node runtime
+
+- continuous block production
+- checkpoint persistence after completed blocks
+- automatic local retention enforcement
+- automatic archival of older blocks to Logos Storage
+- automatic startup recovery from the latest checkpoint
+- recovered chain-head verification
+- continued block production from the recovered height
 
 ### Logos publication
 
@@ -81,37 +101,6 @@ Logos Storage
 - Logos block inclusion observed
 - LIB / finality observed
 - sequencer checkpoint and resume flow
-
-### Logos Storage experiment
-
-The first network-level Storage roundtrip is now working:
-
-```text
-local file
-   ↓
-logosctl
-   ↓
-storage_module v2.1.2
-   ↓
-Logos Storage
-   ↓
-CID
-   ↓
-download by CID
-   ↓
-original bytes recovered
-```
-
-Proven so far:
-
-- Storage module installed and started through the Logos runtime
-- node connected to the `logos.test` network
-- local file uploaded successfully
-- CID returned
-- file downloaded successfully by CID
-- downloaded content matched the original
-
-The actual Solizone checkpoint/block Storage backend is **not implemented yet**.
 
 ---
 
@@ -130,18 +119,19 @@ receipts + state_root
         ↓
 canonical Solizone block
         │
-        ├──────────── local recovery ────────────┐
-        │                                         │
-        ↓                                         ↓
-SolizoneCheckpoint                           BlockStore
-        ↓                                         ↓
-CheckpointBackend                         FileBlockStore
-        ↓                                   recent .szb
-FileCheckpointBackend
-        ↓
-checkpoint.json
+        ├──────────────── persistence ────────────────┐
+        │                                             │
+        ↓                                             ↓
+SolizoneCheckpoint                             HybridBlockStore
+        │                                      │             │
+        ↓                                      ↓             ↓
+CheckpointBackend                        recent blocks    older blocks
+        │                                  local          Logos Storage
+        ├── FileCheckpointBackend                             │
+        └── LogosStorageCheckpointBackend                    ↓
+                                                    height → hash → CID
 
-canonical block
+canonical Solizone block
         ↓
 BlockPublisher
         ↓
@@ -154,66 +144,254 @@ Logos blockchain
 ordering / inclusion / finality
 ```
 
-Persistence direction:
+The execution, persistence, storage, and publication boundaries are intentionally separate.
+
+---
+
+## Hybrid Storage Layer
+
+Solizone now includes a hybrid storage model for canonical block history.
 
 ```text
-CheckpointBackend
-├── FileCheckpointBackend
-└── Logos Storage adapter       ← next
+BlockStore
+├── MemoryBlockStore
+├── FileBlockStore
+└── HybridBlockStore
+      ├── recent blocks → local FileBlockStore
+      └── older blocks  → Logos Storage
+                          via height → hash → CID
+```
 
-Block history
-├── FileBlockStore              → recent local cache
-└── Logos Storage               → older shared history
+A node can keep only a recent local block window while moving older canonical history into Logos Storage.
+
+Example with a retention window of `3`:
+
+```text
+canonical history:
+0 1 2 3 4 5 6
+
+local:
+4 5 6
+
+Logos Storage:
+0 1 2 3
+```
+
+When the local window is exceeded:
+
+```text
+insert new block
+      ↓
+persist locally
+      ↓
+retention exceeded?
+      ↓
+archive oldest block
+      ↓
+upload to Logos Storage
+      ↓
+persist height + hash + CID
+      ↓
+prune local .szb
+```
+
+The archive index is persisted before the local canonical block is removed.
+
+A caller does not need to know where the block physically lives:
+
+```rust
+store.get_by_height(8)?;
+store.get_by_height(2)?;
+```
+
+`HybridBlockStore` checks local storage first and falls back to Logos Storage when the block is archived.
+
+Recovered blocks are:
+
+```text
+downloaded
+    ↓
+decoded
+    ↓
+validated
+    ↓
+hash-checked against canonical metadata
+    ↓
+returned
 ```
 
 ---
 
-## Recovery model we are targeting
+## Logos Storage integration
 
-A normal Solizone node should **not** need to keep the entire chain forever.
+The Storage integration is now part of Solizone persistence rather than a standalone runtime experiment.
+
+### Checkpoints
 
 ```text
-current head = 1,000,000
-
-local node keeps:
-├── current reconstructed EVM state
-├── latest checkpoint
-├── recent block window
-└── small head / CID metadata
-
-Logos Storage keeps:
-└── older checkpoint and block history
+SolizoneCheckpoint
+        ↓
+encode
+        ↓
+LogosStorageCheckpointBackend
+        ↓
+Logos Storage
+        ↓
+CID
 ```
 
-When a node rejoins:
+The latest checkpoint CID is recorded locally as discovery metadata.
+
+On restart:
+
+```text
+checkpoint CID
+      ↓
+Logos Storage
+      ↓
+download checkpoint
+      ↓
+restore EVM state
+      ↓
+restore next_height
+      ↓
+restore parent_hash
+```
+
+### Historical blocks
+
+Canonical `.szb` blocks can be archived individually.
+
+```text
+canonical .szb
+      ↓
+Logos Storage
+      ↓
+CID
+      ↓
+archive index
+height → block hash → CID
+```
+
+The Storage layer stores and retrieves content. It does **not** decide which Solizone block is canonical.
+
+---
+
+## Long-running node runtime
+
+Run:
+
+```bash
+cargo run --bin solizone_node
+```
+
+The runtime continuously owns:
+
+```text
+MemoryState
++
+BlockProducer
++
+HybridBlockStore
++
+LogosStorageCheckpointBackend
+```
+
+Runtime flow:
+
+```text
+execute transaction
+      ↓
+produce block
+      ↓
+insert into HybridBlockStore
+      ↓
+archive / prune old history if needed
+      ↓
+snapshot EVM state
+      ↓
+persist checkpoint to Logos Storage
+      ↓
+continue
+```
+
+If no checkpoint exists, the node starts fresh.
+
+If a previous checkpoint exists:
+
+```text
+existing checkpoint detected
+        ↓
+download from Logos Storage
+        ↓
+restore EVM state
+        ↓
+resume BlockProducer
+        ↓
+verify recovered chain head
+        ↓
+continue block production
+```
+
+A full restart path has been verified with the node stopping at one height and continuing the same parent-linked chain from the next height after recovery.
+
+---
+
+## Recovery model
+
+A normal Solizone node does not need to keep the entire chain locally forever.
+
+```text
+local node keeps:
+├── current reconstructed EVM state
+├── latest checkpoint metadata
+├── recent block window
+└── archive / head metadata
+
+Logos Storage keeps:
+├── execution checkpoints
+└── older canonical block history
+```
+
+After restart:
 
 ```text
 load latest checkpoint
         ↓
-discover canonical head
+restore state + chain head
         ↓
-fetch missing blocks
+verify local head
         ↓
-verify parent linkage
-        ↓
-re-execute missing blocks
-        ↓
-reach current state
-        ↓
-keep only the recent window locally
+continue execution
 ```
 
-Fetched historical blocks do not need to remain on disk forever.
-
-A remaining design problem is **canonical discovery**:
+For historical lookups:
 
 ```text
-latest checkpoint → which CID?
-current head       → which block?
-height N           → which CID?
+request block N
+      ↓
+check local store
+      ↓
+not found
+      ↓
+archive index
+      ↓
+CID
+      ↓
+Logos Storage
+      ↓
+validate + hash-check
 ```
 
-Logos Storage is content-addressed, so Solizone still needs a reliable head/index mechanism.
+Longer-term synchronization still requires a network-level canonical discovery mechanism for:
+
+```text
+latest checkpoint CID
+current canonical head
+height → block hash → CID
+```
+
+The current implementation uses local metadata for that discovery boundary.
 
 ---
 
@@ -227,7 +405,7 @@ execution state
 → committed into block header
 ```
 
-Used for execution/block correctness.
+Used for execution and block correctness.
 
 ### Snapshot commitment
 
@@ -252,14 +430,15 @@ Logos blockchain
 Logos Storage
 → content storage
 → retrieval by CID
-→ checkpoint / history durability experiment
+→ checkpoint persistence
+→ historical block persistence
 ```
 
 Storage does not replace blockchain finality.
 
 ---
 
-## Current checkpoint boundary
+## Checkpoint boundary
 
 ```rust
 pub trait CheckpointBackend {
@@ -276,14 +455,7 @@ pub trait CheckpointBackend {
 }
 ```
 
-Today:
-
-```text
-CheckpointBackend
-└── FileCheckpointBackend
-```
-
-Next:
+Implemented backends:
 
 ```text
 CheckpointBackend
@@ -291,37 +463,27 @@ CheckpointBackend
 └── LogosStorageCheckpointBackend
 ```
 
+This keeps REVM independent from the persistence mechanism.
+
 ---
 
-## Current block storage
+## Block storage boundary
 
 ```text
 BlockStore
 ├── MemoryBlockStore
-└── FileBlockStore
+├── FileBlockStore
+└── HybridBlockStore
 ```
 
-`FileBlockStore` persists canonical `.szb` files by height.
+`HybridBlockStore` adds:
 
-This is correct for local recovery, but keeping every block forever would create unbounded disk growth. The intended direction is:
-
-```text
-recent blocks → local FileBlockStore
-older blocks  → Logos Storage
-```
-
----
-
-## Test status
-
-Current Rust suite:
-
-```text
-29 passed
-0 failed
-```
-
-Coverage includes value transfer, Solidity deployment/calls, mutable state, receipts, deterministic roots, snapshots, checkpoint persistence, parent-linked blocks, producer resume, block storage, block lookup, canonical replacement, and full state + producer + history restart.
+- automatic local retention
+- Logos Storage archival
+- archive index lookup
+- transparent local / remote reads
+- historical block validation
+- canonical hash verification
 
 ---
 
@@ -335,90 +497,68 @@ Not implemented yet:
 - Ethereum fee handling
 - transaction pool
 - Ethereum JSON-RPC
-- long-running production node
 - full imported-block re-execution validation
 - Ethereum MPT state roots
-- atomic checkpoint + block commits
-- persistent block hash index
-- production publisher service
-- Logos Storage checkpoint adapter
-- Logos Storage historical-block adapter
-- canonical head / height → CID discovery
+- network-distributed canonical head / CID discovery
 - explicit Storage replication policy
+- atomic crash-safe checkpoint + block commit protocol
+- production-grade graceful shutdown
+- production publisher service
 
-Logos Storage has been proven at the runtime/network level, but it is **not yet wired into Solizone persistence**.
+These are intentionally deferred to the next development phase.
 
 ---
 
 ## Next development steps
 
-### 1. Store a real `SolizoneCheckpoint` in Logos Storage
+### 1. Raw Ethereum transaction ingestion
 
 ```text
-SolizoneCheckpoint
+signed Ethereum transaction
         ↓
-encode_json()
+decode transaction envelope
         ↓
-checkpoint file
+recover sender
         ↓
-storage_module
+admission validation
         ↓
-CID
-        ↓
-download
-        ↓
-decode_json()
-        ↓
-restore EVM state
+Solizone transaction
 ```
 
-### 2. Implement a Logos Storage checkpoint adapter
+### 2. Transaction pool
 
 ```text
-CheckpointBackend
-├── FileCheckpointBackend
-└── LogosStorageCheckpointBackend
+incoming transactions
+        ↓
+Solizone mempool
+        ↓
+BlockProducer
+        ↓
+REVM
 ```
 
-### 3. Archive canonical block history
-
-```text
-recent .szb blocks
-→ local FileBlockStore
-
-older .szb blocks
-→ Logos Storage
-```
-
-### 4. Design canonical discovery
-
-```text
-latest checkpoint CID
-latest canonical head
-height → block hash → CID
-```
-
-### 5. Continue toward an EVM developer surface
+### 3. Ethereum-compatible JSON-RPC
 
 ```text
 Foundry / MetaMask / ethers / viem
         ↓
 Ethereum JSON-RPC
         ↓
-raw signed transactions
-        ↓
-transaction pool
-        ↓
-BlockProducer
-        ↓
-REVM
-        ↓
-Solizone state
-        ↓
-canonical block
-        ↓
-Logos
+Solizone node
 ```
+
+### 4. Independent block validation
+
+A second execution path should be able to consume canonical blocks, re-execute transactions, and independently verify resulting commitments.
+
+### 5. Production hardening
+
+- crash-safe persistence
+- graceful shutdown
+- archive-index durability
+- distributed CID / head discovery
+- replication strategy
+- durable publisher service
 
 ---
 
@@ -435,12 +575,15 @@ solizone-evm/
 │   ├── block_store.rs
 │   ├── memory_block_store.rs
 │   ├── file_block_store.rs
+│   ├── hybrid_block_store.rs
+│   ├── logos_storage_client.rs
 │   ├── publisher.rs
 │   ├── logos_publisher.rs
 │   ├── bin/
+│   │   ├── solizone_node.rs
 │   │   ├── publish.rs
-│   │   ├── state_writer.rs
-│   │   └── state_reader.rs
+│   │   ├── hybrid_node_restart.rs
+│   │   └── ...
 │   ├── state/
 │   │   ├── memory.rs
 │   │   ├── snapshot.rs
@@ -449,7 +592,8 @@ solizone-evm/
 │   │   ├── checkpoint.rs
 │   │   ├── checkpoint_backend.rs
 │   │   ├── file_backend.rs
-│   │   └── file_checkpoint_backend.rs
+│   │   ├── file_checkpoint_backend.rs
+│   │   └── logos_storage_checkpoint_backend.rs
 │   └── execution/
 │       ├── revm_engine.rs
 │       ├── transaction.rs
@@ -464,19 +608,33 @@ solizone-evm/
 
 ## Useful commands
 
+### Rust
+
 ```bash
 cargo fmt
 cargo check
 cargo test
-
-cargo test resumes_full_node_from_disk_checkpoint -- --nocapture
-
-cargo run --bin publish
-cargo run --bin publish -- --send
-RUST_LOG=warn cargo run --bin publish -- --resume
 ```
 
-### Logos Storage experiment
+Run the long-running Solizone node:
+
+```bash
+cargo run --bin solizone_node
+```
+
+Reset the local runtime state:
+
+```bash
+cargo run --bin solizone_node -- reset
+```
+
+Run the Logos publication harness:
+
+```bash
+cargo run --bin publish
+```
+
+### Logos Storage
 
 ```bash
 logosctl module load storage_module
@@ -514,8 +672,8 @@ REVM should not depend directly on Logos Storage.
 
 Storage and blockchain finality are different layers.
 
-That separation lets Solizone evolve without coupling execution to one persistence or publication mechanism.
+That separation lets Solizone evolve without coupling execution to a single persistence or publication mechanism.
 
 ---
 
-**Solizone is an independent research prototype and is not an official Logos project.**
+**Solizone is an independent research implementation and is not an official Logos project.**
